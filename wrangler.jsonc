@@ -1,0 +1,24 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "ksiegai-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-10",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "observability": {
+    "enabled": true
+  },
+
+  "durable_objects": {
+    "bindings": [{ "name": "KsiegaiMcp", "class_name": "KsiegaiMcp" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["KsiegaiMcp"] }],
+
+  // Worker-to-worker, no public hop — reuses ksiegai-gateway's existing
+  // service/repo layer (RLS, requireSession, posting/COA logic) instead of
+  // this Worker touching Postgres or re-implementing anything.
+  "services": [{ "binding": "GATEWAY", "service": "ksiegai-gateway" }],
+
+  "routes": [{ "pattern": "mcp.ksiegai.pl", "custom_domain": true }],
+  "workers_dev": true
+}
