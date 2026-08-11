@@ -10,9 +10,9 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
-    const props = resolveAccessToken(request);
+    const props = await resolveAccessToken(request);
     if (!props) {
-      return new Response(JSON.stringify({ error: "unauthorized", message: "Missing bearer token" }), {
+      return new Response(JSON.stringify({ error: "unauthorized", message: "Missing or malformed bearer token" }), {
         status: 401,
         headers: { "content-type": "application/json" },
       });

@@ -2,7 +2,7 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "ksiegai-mcp",
   "main": "src/index.ts",
-  "compatibility_date": "2026-08-10",
+  "compatibility_date": "2026-08-08",
   "compatibility_flags": ["nodejs_compat"],
 
   "observability": {
@@ -20,5 +20,9 @@
   "services": [{ "binding": "GATEWAY", "service": "ksiegai-gateway" }],
 
   "routes": [{ "pattern": "mcp.ksiegai.pl", "custom_domain": true }],
-  "workers_dev": true
+  "workers_dev": true,
+
+  // Default inspector port (9229) collides with ksiegai-gateway's own dev
+  // inspector when both wrangler dev processes run at once locally.
+  "dev": { "inspector_port": 9230 }
 }
