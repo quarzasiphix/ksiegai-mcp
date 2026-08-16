@@ -102,30 +102,31 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
       "list_business_profiles",
       {
         description:
-          "List the ksiegai business profile this connection is authorized for (id, name, entity type, tax " +
-          "regime, VAT-exempt status). Each MCP connection is scoped to exactly one business at creation time " +
-          "(Ustawienia -> Połącz AI (MCP)) - call this first to get its businessProfileId, required by every " +
-          "other tool.",
+          "List the ksiegai business profile(s) this connection is authorized for (id, name, entity type, " +
+          "tax regime, VAT-exempt status). A connection can cover one or more businesses, each with its own " +
+          "permission tier (Ustawienia -> Połącz AI (MCP)) - call this first to get the businessProfileId(s), " +
+          "required by every other tool. An empty result means no business has been granted to this " +
+          "connection yet - tell the user to add one in Ustawienia -> Połącz AI (MCP) -> edit this connection.",
         inputSchema: {},
       },
       async () => {
         // Bespoke, not routed through this.call(): this is the one tool
         // that structurally has no businessProfileId to declare up front
-        // (its whole job is to reveal it) - it exchanges for
-        // authorizedBusinessProfileId itself and filters core.init's
-        // result down to just that one business, so a connection scoped
-        // to business A never leaks the names/NIPs of the user's OTHER
-        // businesses even though the underlying session JWT's RLS access
-        // spans all of them.
+        // (its whole job is to reveal them) - it exchanges for
+        // authorizedBusinessProfileIds itself (T-418 multi-company,
+        // 2026-08-17) and filters core.init's result down to just those
+        // businesses, so a connection scoped to businesses A+B never leaks
+        // the names/NIPs of the user's OTHER businesses even though the
+        // underlying session JWT's RLS access spans all of them.
         if (!this.props?.mcpTokenHash) {
           return { content: [{ type: "text", text: "Not authenticated." }], isError: true };
         }
         let accessToken: string;
-        let authorizedBusinessProfileId: string;
+        let authorizedBusinessProfileIds: string[];
         try {
           const exchanged = await authenticateMcpCall(this.env, this.props.mcpTokenHash, "list_business_profiles");
           accessToken = exchanged.accessToken;
-          authorizedBusinessProfileId = exchanged.authorizedBusinessProfileId;
+          authorizedBusinessProfileIds = exchanged.authorizedBusinessProfileIds;
         } catch (err) {
           if (err instanceof McpAuthError) return authErrorResult(err);
           return { content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }], isError: true };
@@ -139,9 +140,10 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
         }
 
         try {
+          const authorizedIds = new Set(authorizedBusinessProfileIds);
           const parsed = result as { businessProfiles?: any[] };
           const profiles = (parsed.businessProfiles || [])
-            .filter((p: any) => p.id === authorizedBusinessProfileId)
+            .filter((p: any) => authorizedIds.has(p.id))
             .map((p: any) => ({
               businessProfileId: p.id,
               name: p.name,
@@ -817,7 +819,7 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
                 "1. " +
                 (businessProfileId
                   ? `Use businessProfileId ${businessProfileId}.`
-                  : "Call list_business_profiles to get the businessProfileId (there's exactly one for this connection).") +
+                  : "Call list_business_profiles to get the businessProfileId - if the connection covers more than one business, ask the user which one.") +
                 "\n" +
                 "2. Read the document yourself (you have vision - this MCP server does no OCR) and extract: " +
                 "supplier name, supplier NIP if shown, issue date, due date if shown, currency, and each line " +

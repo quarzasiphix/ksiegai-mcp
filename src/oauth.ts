@@ -100,8 +100,8 @@ async function handleAuthorizeComplete(request: Request, env: Env): Promise<Resp
   const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
     request: oauthRequest,
     userId: connection.userId,
-    metadata: { agentName: connection.agentName, businessProfileId: connection.businessProfileId, permissionTier: connection.permissionTier },
-    scope: oauthRequest.scope?.length ? oauthRequest.scope : [connection.permissionTier],
+    metadata: { agentName: connection.agentName, businessProfileCount: connection.businessProfileCount },
+    scope: oauthRequest.scope?.length ? oauthRequest.scope : [],
     props: { mcpTokenHash: connection.tokenHash },
   });
 

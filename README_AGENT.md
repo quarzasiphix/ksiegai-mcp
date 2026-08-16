@@ -332,9 +332,12 @@ Real OAuth 2.1 authorization-code flow (`@cloudflare/workers-oauth-provider`,
 `src/index.ts` + `src/oauth.ts`) sitting *alongside*, not replacing, the
 manual `mcp_...` token flow above — an MCP client can now click "connect",
 have a browser open, log in / approve, and be connected automatically,
-instead of copy-pasting a token from Ustawienia. Pre-registered clients
-only (Claude Code, Claude Desktop, Codex) — no dynamic/self-service client
-registration.
+instead of copy-pasting a token from Ustawienia. Dynamic Client
+Registration (RFC 7591, `/register`) enabled 2026-08-17 — any MCP client
+self-registers on first connect, no admin step needed per client. The
+admin-gated `POST /admin/register-client` (below) still exists for
+manually pre-registering a specific client if ever wanted, but is no
+longer the only way in.
 
 **Key design point**: OAuth is just another way to arrive at an
 `mcp_access_tokens` row — `completeAuthorization`'s `props` is
@@ -392,18 +395,43 @@ calls `env.OAUTH_PROVIDER.createClient({clientId, clientName, redirectUris,
 tokenEndpointAuthMethod: 'none', grantTypes: [...]})`. Run once per client
 after deploy.
 
-**Not yet live-tested end-to-end** (same local-DB-rehearsal block as the
-accounting tools above) and **not deployable as-is**:
-`wrangler.jsonc`'s `OAUTH_KV` namespace id is a placeholder
-(`REPLACE_WITH_REAL_KV_NAMESPACE_ID`) — run
+**Live-tested end-to-end locally, 2026-08-16**: `wrangler dev` for both
+`ksiegai-gateway` (8787) and `ksiegai-mcp` (8788, KV simulated locally) +
+local Supabase, full curl-driven rehearsal of every hop — `POST
+/admin/register-client` → `GET /authorize` (302 with `requestToken`) →
+`mcp.createConnection` (forged local JWT + PKCE, matching what
+`McpAuthorize.tsx` sends) → `GET /authorize/complete` (302 with a real
+code to the client's `redirect_uri`, state preserved) → `POST /oauth/token`
+(PKCE `code_verifier`, real access+refresh token) → `POST /mcp` with that
+OAuth access token — `initialize` then `tools/call list_business_profiles`
+returned real data. Also confirmed revocation is live: updating
+`revoked_at` on the claimed row mid-session made the very next tool call
+fail with the same "invalid, expired, or revoked" message the manual-token
+path already gave — `authenticateMcpCall` really is shared, unchanged, as
+designed.
+
+**Bug found and fixed by this rehearsal**: local Postgres had migration
+`20260815170000_mcp_access_tokens_oauth_request_token.sql` un-applied
+(schema-drift, not a code bug — the migration itself had already reached
+remote earlier) — `mcp.createConnection` 502'd locally with PostgREST's
+`PGRST204 Could not find the 'oauth_request_token' column`. Fixed locally
+with `supabase migration up --local` + `NOTIFY pgrst, 'reload schema'`.
+Confirmed via `supabase db push --dry-run` (2026-08-16) that remote
+already has this migration applied — not a blocker for deploy.
+
+**Still not deployable as-is**: `wrangler.jsonc`'s `OAUTH_KV` namespace id
+is a placeholder (`REPLACE_WITH_REAL_KV_NAMESPACE_ID`) — run
 `wrangler kv namespace create ksiegai-mcp-oauth-kv` and put the real id in
 before deploying. `wrangler deploy --dry-run` couldn't be verified in this
 dev environment either (hangs, apparently on Cloudflare auth needed to
 resolve/validate the KV namespace reference) — `tsc --noEmit` is clean and
 the code was reviewed line-by-line against `workers-oauth-provider`'s
 actual shipped `.d.ts` (not just its README, which was missing/wrong on a
-few signatures), but this hasn't been bundle-verified the way Pass 1/2's
-tools were.
+few signatures). Also still needed before a real client can connect: the
+remote `MCP_ADMIN_SECRET` Worker secret set, and `POST
+/admin/register-client` actually called once per real client (Claude Code,
+Claude Desktop, Codex) against the deployed Worker — the local rehearsal's
+registered client only exists in local KV.
 
 ## Local dev
 
@@ -418,14 +446,66 @@ Needs `ksiegai-gateway` reachable via the Service Binding — `wrangler dev`
 resolves Service Bindings to the target Worker's own `wrangler dev`
 instance if running locally, or its deployed version otherwise.
 
+## Multi-company connections (2026-08-17)
+
+A connection used to bind exactly one business profile + one permission
+tier (`mcp_access_tokens.business_profile_id`/`permission_tier`). As of
+`mcp_access_token_scopes` (ksef-ai migration
+`20260817120000_mcp_access_token_scopes.sql`), a connection can cover any
+number of businesses, each with its **own** tier — e.g. `full_post` on one
+company, `read_only` on another, in the same Claude Code connection.
+`mcp_access_tokens`' own `business_profile_id`/`permission_tier` columns
+are now nullable legacy columns, kept only for the rows that existed
+before this migration; every new connection leaves them null and writes
+only to the scopes table.
+
+Every piece downstream stayed compatible with almost no shape change:
+- `public-api`'s `mcp.authenticate` now looks up the caller's declared
+  `businessProfileId` in the scopes table (not the token row) to find its
+  tier. Omitting `businessProfileId` (the bare `list_business_profiles`
+  exchange) returns `authorizedBusinessProfileIds: string[]` — the full
+  set — instead of a single id.
+- A connection with a `businessProfileId` it has no scope for gets a new,
+  specific 403: *"This connection has no access to this business. Ask the
+  user to grant it in ksiegai -> Ustawienia -> Połącz AI (MCP) -> edit
+  this connection's companies."* — this Worker's `authErrorResult` just
+  forwards that message straight through to the calling AI, so an agent
+  hitting a business it wasn't granted tells the user exactly where to
+  fix it, rather than failing opaquely.
+- `list_business_profiles` (`mcp-agent.ts`) filters `core.init`'s result
+  against the whole `authorizedBusinessProfileIds` set instead of a single
+  id.
+- OAuth's `props` shape (`{ mcpTokenHash }`) and the whole
+  authorize/complete/token-exchange flow are **completely unchanged** —
+  scopes are re-checked per tool call regardless of how the connection was
+  created, exactly like the OAuth pass itself predicted.
+- New `mcp.updateConnectionScopes` action (ksiegai-workspace) lets
+  Ustawienia's "Edytuj uprawnienia" dialog add/remove companies or change
+  a company's tier on an *existing* connection without reissuing a token —
+  RLS alone decides who can touch which row (see the migration's header:
+  adding a new company requires being the connection's creator AND
+  admining that company; removing one or changing its tier only requires
+  admining it, so any company admin can always pull their own company out
+  of a connection they didn't create).
+
+Live-tested locally 2026-08-17 end to end via curl against `ksiegai-gateway`
++ `public-api`: multi-scope create, list (full scope set returned), update
+(add+remove+tier-change in one call), then `mcp.authenticate` for an
+allowed business/tier (200), a removed business (403, exact message
+above), a wrong-tier business (403, tier message), and the bare
+`list_business_profiles` exchange (returned both remaining ids). Deployed
+to production the same day: migration pushed, `public-api` +
+`ksiegai-workspace` redeployed, this Worker redeployed.
+
 ## Next steps (not built)
 
 1. ~~`mcp_access_tokens` + `mcp_audit_log` tables~~ — done 2026-08-11, see
    "Auth — Phase 1" above.
-2. ~~OAuth auto-connect~~ — built 2026-08-15, see "OAuth auto-connect"
-   section below. **Not yet live-tested** (same local-DB-rehearsal block
-   as Pass 2's tools) and needs a real `OAUTH_KV` namespace + pre-registered
-   clients before it does anything in a real deploy — see that section.
+2. ~~OAuth auto-connect~~ — built 2026-08-15, live-tested end-to-end
+   locally 2026-08-16, see "OAuth auto-connect" section above. Needs a real
+   `OAUTH_KV` namespace + the `oauth_request_token` migration pushed to
+   remote + pre-registered clients before it does anything in a real
+   deploy — see that section.
 3. ~~Write tools: `draft_journal_entry`, `post_journal_entry`~~ — done
    2026-08-15, see "Pass 2" above. `setup_chart_of_accounts` still not
    built.

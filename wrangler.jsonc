@@ -24,7 +24,7 @@
   // real deploy, run `wrangler kv namespace create ksiegai-mcp-oauth-kv`
   // and replace "id" below. `wrangler dev` (local mode) doesn't need a real
   // provisioned namespace to run — it simulates KV locally regardless.
-  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "REPLACE_WITH_REAL_KV_NAMESPACE_ID" }],
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "78bfae7797504dccbdbab57da6abcb0d" }],
 
   // Where the OAuth /authorize handler redirects the browser to for the
   // actual login + business/tier consent screen (McpAuthorize.tsx in

@@ -19,14 +19,21 @@ const apiHandler = {
 
 // OAuth auto-connect (T-418 continuation, 2026-08-15) — see
 // README_AGENT.md's "OAuth auto-connect" section and src/oauth.ts for the
-// full flow. Pre-registered clients only (no dynamic/self-service
-// registration): clientRegistrationEndpoint is deliberately left unset.
+// full flow. Dynamic Client Registration (RFC 7591) enabled 2026-08-17 so
+// any MCP client (Claude Code, Claude Desktop, Codex, etc.) can self-
+// register a client_id on first "connect" with no manual
+// /admin/register-client round-trip — the standard shape for "click
+// connect" remote MCP servers. This only lets a client register itself an
+// OAuth *client* record; it still can't reach any accounting data without
+// a human logging in and approving a specific business/tier on
+// McpAuthorize.tsx, so DCR doesn't weaken the real access boundary.
 const oauthProvider = new OAuthProvider({
   apiRoute: "/mcp",
   apiHandler,
   defaultHandler,
   authorizeEndpoint: "/authorize",
   tokenEndpoint: "/oauth/token",
+  clientRegistrationEndpoint: "/register",
   accessTokenTTL: 3600,
 });
 

@@ -10,8 +10,9 @@ async function sha256Hex(input: string): Promise<string> {
 /**
  * Phase 1 (T-418, replaces Phase 0): the MCP bearer is an opaque `mcp_...`
  * token issued from ksiegai's Settings -> "Połącz AI (MCP)" screen
- * (McpConnect.tsx), one per connection, scoped to a single business
- * profile + permission tier, revocable, optionally expiring. Hashed HERE,
+ * (McpConnect.tsx), one per connection, scoped to one or more business
+ * profiles each with their own permission tier (mcp_access_token_scopes,
+ * T-418 multi-company, 2026-08-17), revocable, optionally expiring. Hashed HERE,
  * once, before it ever reaches the Durable Object — the raw token never
  * enters KsiegaiMcp's props/memory, only its hash.
  *

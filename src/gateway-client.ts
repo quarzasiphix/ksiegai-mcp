@@ -59,7 +59,7 @@ export async function authenticateMcpCall(
   tokenHash: string,
   toolName: string,
   businessProfileId?: string,
-): Promise<{ accessToken: string; expiresAt: string; authorizedBusinessProfileId: string }> {
+): Promise<{ accessToken: string; expiresAt: string; authorizedBusinessProfileId?: string; authorizedBusinessProfileIds: string[] }> {
   // Dedicated route (not the generic /v1/public proxy) — see
   // ksiegai-gateway/src/routes/public.ts's mcpAuthenticate doc comment:
   // the generic proxy's rate limit is keyed by cf-connecting-ip, which is
@@ -87,7 +87,7 @@ export async function authenticateMcpCall(
     throw new McpAuthError(response.status, message);
   }
 
-  return (body as { data: { accessToken: string; expiresAt: string; authorizedBusinessProfileId: string } }).data;
+  return (body as { data: { accessToken: string; expiresAt: string; authorizedBusinessProfileId?: string; authorizedBusinessProfileIds: string[] } }).data;
 }
 
 /**
@@ -101,15 +101,18 @@ export async function authenticateMcpCall(
  * OAuth authorization code itself), no separate shared secret needed.
  * public-api's `mcp.resolveOAuthConnection` atomically claims the matching
  * mcp_access_tokens row (clears its oauth_request_token so a replay 404s)
- * and returns the connection's hash + owning user + business, which this
- * Worker turns straight into completeAuthorization's `props` — identical
- * shape to the manual mcp_... token path, so every downstream tool call
- * still goes through the normal live authenticateMcpCall check.
+ * and returns the connection's hash + owning user, which this Worker turns
+ * straight into completeAuthorization's `props` — identical shape to the
+ * manual mcp_... token path, so every downstream tool call still goes
+ * through the normal live authenticateMcpCall check. Per-company/tier
+ * details (`businessProfileCount` here is informational only, for
+ * metadata/logging) live in mcp_access_token_scopes and are re-checked
+ * fresh on every tool call — T-418 multi-company, 2026-08-17.
  */
 export async function resolveOAuthConnection(
   env: Env,
   requestToken: string,
-): Promise<{ tokenHash: string; userId: string; businessProfileId: string; agentName: string; permissionTier: string }> {
+): Promise<{ tokenHash: string; userId: string; agentName: string; businessProfileCount: number }> {
   const response = await env.GATEWAY.fetch("https://internal/v1/public/mcp/resolve-oauth-connection", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -121,7 +124,7 @@ export async function resolveOAuthConnection(
     const message = body && typeof body === "object" && "error" in body ? JSON.stringify(body.error) : response.statusText;
     throw new McpAuthError(response.status, message);
   }
-  return (body as { data: { tokenHash: string; userId: string; businessProfileId: string; agentName: string; permissionTier: string } }).data;
+  return (body as { data: { tokenHash: string; userId: string; agentName: string; businessProfileCount: number } }).data;
 }
 
 /**
