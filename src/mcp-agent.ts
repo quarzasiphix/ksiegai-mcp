@@ -381,15 +381,20 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
     this.server.registerTool(
       "list_invoices",
       {
-        description: "List invoices (income and expense) for this connection's business profile, optionally within a date range.",
+        description:
+          "List invoices (income and expense) for this connection's business profile - full detail per invoice " +
+          "(customer/supplier, line items, amounts, VAT, KSeF status), not just headers. Optionally filter by " +
+          "date range (issueDate) and/or contractorTaxId (NIP) to pull every invoice for one counterparty, e.g. " +
+          "\"all invoices from/to NIP 1234567890 this year\".",
         inputSchema: {
           businessProfileId: z.string().uuid(),
-          startDate: z.string().optional().describe("ISO date, YYYY-MM-DD"),
-          endDate: z.string().optional().describe("ISO date, YYYY-MM-DD"),
+          startDate: z.string().optional().describe("ISO date, YYYY-MM-DD - filters on issue date"),
+          endDate: z.string().optional().describe("ISO date, YYYY-MM-DD - filters on issue date"),
+          contractorTaxId: z.string().optional().describe("Counterparty NIP - returns only invoices for that customer/supplier"),
         },
       },
-      async ({ businessProfileId, startDate, endDate }) =>
-        this.call("list_invoices", businessProfileId, "invoices.listInvoices", { businessProfileId, startDate, endDate }),
+      async ({ businessProfileId, startDate, endDate, contractorTaxId }) =>
+        this.call("list_invoices", businessProfileId, "invoices.listInvoices", { businessProfileId, startDate, endDate, contractorTaxId }),
     );
 
     const expenseItemSchema = z.object({
@@ -431,6 +436,94 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
         },
       },
       async (params) => this.call("add_expense_invoice", params.businessProfileId, "invoices.createExpense", params),
+    );
+
+    const documentCategorySchema = z
+      .enum([
+        "contracts_vehicles",
+        "contracts_infrastructure",
+        "contracts_services",
+        "contracts_other",
+        "resolutions",
+        "licenses",
+        "financial_statements",
+        "tax_filings",
+        "other",
+      ])
+      .describe("company_documents category");
+
+    this.server.registerTool(
+      "list_company_documents",
+      {
+        description:
+          "List company documents (contracts, resolutions, licenses, financial statements, tax filings, etc) " +
+          "for this connection's business profile - metadata only (title, category, dates, file name), not file " +
+          "content. Use get_company_document for a single document's detail plus a download URL.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          category: documentCategorySchema.optional().describe("Filter to one category - omit to list all"),
+        },
+      },
+      async ({ businessProfileId, category }) =>
+        this.call("list_company_documents", businessProfileId, "documents.listCompanyDocuments", { businessProfileId, category }),
+    );
+
+    this.server.registerTool(
+      "get_company_document",
+      {
+        description:
+          "Get one company document's full metadata plus a time-limited (1 hour) signed download URL for its " +
+          "file. Use list_company_documents first to find the documentId.",
+        inputSchema: {
+          businessProfileId: z.string().uuid().describe("This connection's business profile - not forwarded to the lookup itself, only used to authorize the call"),
+          documentId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, documentId }) => {
+        const docResult = await this.call("get_company_document", businessProfileId, "documents.getCompanyDocument", { id: documentId });
+        if (docResult.isError) return docResult;
+        let document: unknown = null;
+        try {
+          document = (JSON.parse(docResult.content[0].text) as { document?: unknown }).document ?? null;
+        } catch {
+          // fall through with document = null
+        }
+        if (!document) {
+          return { content: [{ type: "text", text: `Document ${documentId} not found.` }], isError: true };
+        }
+        const urlResult = await this.call("get_company_document", businessProfileId, "documents.getDocumentUrl", { id: documentId });
+        if (urlResult.isError) return urlResult;
+        let url: unknown = null;
+        try {
+          url = JSON.parse(urlResult.content[0].text);
+        } catch {
+          // fall through with url = null
+        }
+        return { content: [{ type: "text", text: JSON.stringify({ document, ...(url as object) }) }] };
+      },
+    );
+
+    this.server.registerTool(
+      "upload_company_document",
+      {
+        description:
+          "Upload a company document (e.g. a contract, resolution, license, or financial statement the caller " +
+          "already has as a file) and record its metadata. The caller supplies the file's raw bytes as base64 - " +
+          "this tool does no OCR/extraction, it just stores what it's given. Requires a connection with " +
+          "draft_write or full_post permission tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          category: documentCategorySchema,
+          fileName: z.string().describe("Original file name, e.g. umowa.pdf"),
+          mimeType: z.string().optional().describe("e.g. application/pdf - defaults to application/octet-stream"),
+          fileContentBase64: z.string().describe("The file's raw bytes, base64-encoded (a data: URL prefix is fine and will be stripped)"),
+          title: z.string(),
+          description: z.string().optional(),
+          documentDate: z.string().optional().describe("ISO date, YYYY-MM-DD"),
+          referenceNumber: z.string().optional(),
+        },
+      },
+      async (params) => this.call("upload_company_document", params.businessProfileId, "documents.uploadCompanyDocument", params),
     );
 
     this.server.registerTool(

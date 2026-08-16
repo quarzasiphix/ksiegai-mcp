@@ -139,8 +139,10 @@ provider flow.
   `is_company_member()` scoping) before calling the RPC, since
   `_assert_bp_member` can't be called directly from an edge function
   (`REVOKE EXECUTE FROM authenticated`).
-- `list_invoices(businessProfileId, startDate?, endDate?)` — wraps the
-  already-existing `invoices.listInvoices`, zero new backend work.
+- `list_invoices(businessProfileId, startDate?, endDate?, contractorTaxId?)`
+  — wraps `invoices.listInvoices`. `contractorTaxId` (NIP) added
+  2026-08-16 (see "Pass 3" below) for "every invoice for counterparty X"
+  without knowing a `customer_id` first.
 - `list_bank_accounts(businessProfileId)` / `list_bank_transactions(accountId)`
   — wrap bank-api's already-existing `list-accounts`/`list-transactions`
   (a *different* edge function than `ksiegai-workspace`, reached via the
@@ -268,6 +270,44 @@ method as the Pass 1 tools (below) once that's done, then update this note.
   return value (the actual posted journal entry is correct — verified
   directly against `journal_lines` — only the response payload is wrong).
   Documented, not fixed, in `ksef-ai/supabase/functions/bank-api/README_AGENT.md`.
+
+## Pass 3 (2026-08-16): NIP-filtered invoices + document tools
+
+- `list_invoices` gained `contractorTaxId` (see "Tools" above) — new
+  `ksiegai-workspace` migration
+  (`20260816120000_get_invoices_list_contractor_tax_id.sql`) adds
+  `get_invoices_list`'s `p_contractor_tax_id` param, filtering on
+  `customers.tax_id`.
+- `list_company_documents(businessProfileId, category?)` — wraps
+  `documents.listCompanyDocuments` (already existed), zero new backend
+  work. `category` is one of `company_documents`'s 9 check-constraint
+  values (contracts_vehicles/contracts_infrastructure/contracts_services/
+  contracts_other/resolutions/licenses/financial_statements/tax_filings/
+  other).
+- `get_company_document(businessProfileId, documentId)` — 2 internal calls
+  under one tool: `documents.getCompanyDocument` (metadata) then new
+  `documents.getDocumentUrl` (1-hour signed download URL for the row's
+  `file_path`), merged into one response. Both new-this-pass on the
+  workspace side except `getCompanyDocument` itself, which already existed.
+- `upload_company_document(businessProfileId, category, fileName, mimeType?, fileContentBase64, title, description?, documentDate?, referenceNumber?)`
+  — wraps new `documents.uploadCompanyDocument`. The caller supplies raw
+  file bytes as base64 (already-read/extracted, same "no OCR here" posture
+  as `add_expense_invoice`/`import_bank_statement`); the route decodes,
+  uploads to the `company-documents` Storage bucket, then writes the
+  `company_documents` metadata row via the existing
+  `rpc_save_company_document`. draft_write tier. No `folderId` support
+  yet — lands in the category's legacy (non-folder) path, same as every
+  upload before folders existed.
+
+`list_company_documents`/`get_company_document` added to `READ_ONLY_TOOLS`,
+`upload_company_document` added to `DRAFT_WRITE_EXTRA`, in `public-api`'s
+`mcp.actions.ts`.
+
+**Not yet live-tested end-to-end** — same local-DB-rehearsal gap as Pass 2.
+Verify with a real MCP call once local Supabase is caught up: upload a
+small file, confirm `list_company_documents` shows it, confirm
+`get_company_document` returns a signed URL that actually resolves the
+uploaded bytes.
 
 ## Prompts
 
