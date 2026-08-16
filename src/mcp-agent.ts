@@ -91,6 +91,13 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
       PRIMARY KEY (bank_transaction_id, credit_account_id)
     )`;
 
+    // Same confirm-before-post gate, for manual journal entries - see
+    // preview_journal_entry_posting / post_journal_entry below.
+    this.sql`CREATE TABLE IF NOT EXISTS journal_posting_previews (
+      journal_entry_id TEXT NOT NULL PRIMARY KEY,
+      previewed_at INTEGER NOT NULL
+    )`;
+
     this.server.registerTool(
       "list_business_profiles",
       {
@@ -182,6 +189,193 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
       },
       async ({ businessProfileId, asOfDate, periodYear, periodMonth }) =>
         this.call("get_balance_sheet", businessProfileId, "accounting.getAccountBalances", { businessProfileId, asOfDate, periodYear, periodMonth }),
+    );
+
+    this.server.registerTool(
+      "get_posting_queue",
+      {
+        description:
+          "The posting queue - every unposted/needs-review economic event for this business profile: invoices, " +
+          "financing contracts (loans, capital contributions), shareholder loan repayments, bank transactions, " +
+          "and Stripe period settlements, each with a suggested debit/credit posting template (chart-of-accounts " +
+          "codes) and, for bank transactions, a possible match against an outstanding invoice. Read-only - use " +
+          "this to see what still needs accounting attention, then classify_bank_transaction / " +
+          "preview_bank_transaction_posting+post_bank_transaction / draft_journal_entry to actually act on an item.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          startDate: z.string().optional().describe("ISO date, YYYY-MM-DD"),
+          endDate: z.string().optional().describe("ISO date, YYYY-MM-DD"),
+        },
+      },
+      async ({ businessProfileId, startDate, endDate }) =>
+        this.call("get_posting_queue", businessProfileId, "accounting.getPostingQueue", { businessProfileId, startDate, endDate }),
+    );
+
+    this.server.registerTool(
+      "get_period_report",
+      {
+        description:
+          "Real profit & loss for one calendar month - revenue total, expense total, net result, and a " +
+          "per-account breakdown (code, name, type, current balance, this-period movement, year-to-date " +
+          "movement), built from posted journal entries only. Cross-reference get_chart_of_accounts for full " +
+          "account names/types if not returned inline.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          periodYear: z.number().optional().describe("Defaults to current year"),
+          periodMonth: z.number().optional().describe("1-12, defaults to current month"),
+        },
+      },
+      async ({ businessProfileId, periodYear, periodMonth }) =>
+        this.call("get_period_report", businessProfileId, "accounting.getPeriodReport", { businessProfileId, periodYear, periodMonth }),
+    );
+
+    this.server.registerTool(
+      "list_journal_entries",
+      {
+        description:
+          "List journal entries (with their lines) for this business profile - the general ledger. Optionally " +
+          "filter by status (draft/posted/void/reversed), date range, or source_type (e.g. invoice, bank_transaction, " +
+          "manual). Use this to see the actual postings behind get_period_report's totals or get_balance_sheet's " +
+          "balances.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          status: z.string().optional().describe("draft | posted | void | reversed"),
+          startDate: z.string().optional().describe("ISO date, YYYY-MM-DD"),
+          endDate: z.string().optional().describe("ISO date, YYYY-MM-DD"),
+          sourceType: z.string().optional(),
+          limit: z.number().optional(),
+        },
+      },
+      async ({ businessProfileId, status, startDate, endDate, sourceType, limit }) =>
+        this.call("list_journal_entries", businessProfileId, "accounting.listJournalEntries", { businessProfileId, status, startDate, endDate, sourceType, limit }),
+    );
+
+    const journalLineSchema = z.object({
+      accountId: z.string().uuid().describe("From get_chart_of_accounts"),
+      side: z.enum(["debit", "credit"]),
+      amount: z.number().positive().describe("PLN, e.g. 123.45 - not minor units"),
+      description: z.string().optional(),
+      lineNumber: z.number().int().describe("1-based, unique within this entry"),
+    });
+
+    this.server.registerTool(
+      "draft_journal_entry",
+      {
+        description:
+          "Create a manual journal entry (debits/credits must balance to within 0.01) for something not covered " +
+          "by a bank transaction or invoice - e.g. a correction, accrual, or depreciation entry. Requires " +
+          "draft_write or full_post permission tier. ALWAYS created as entry_status='draft' - never auto-posted, " +
+          "regardless of tier. Use preview_journal_entry_posting then post_journal_entry (with explicit user " +
+          "confirmation) to actually post it to the ledger.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          entryDate: z.string().describe("ISO date, YYYY-MM-DD"),
+          description: z.string(),
+          referenceNumber: z.string().optional(),
+          notes: z.string().optional(),
+          lines: z.array(journalLineSchema).min(2).describe("At least one debit line and one credit line"),
+        },
+      },
+      async ({ businessProfileId, entryDate, description, referenceNumber, notes, lines }) => {
+        const payloadLines = lines.map((l) => ({
+          account_id: l.accountId,
+          side: l.side,
+          amount: l.amount,
+          description: l.description,
+          line_number: l.lineNumber,
+        }));
+        return this.call("draft_journal_entry", businessProfileId, "accounting.createJournalEntry", {
+          businessProfileId,
+          entryDate,
+          description,
+          referenceNumber,
+          notes,
+          lines: payloadLines,
+        });
+      },
+    );
+
+    this.server.registerTool(
+      "preview_journal_entry_posting",
+      {
+        description:
+          "Dry-run preview of posting a draft journal entry - shows the entry and its lines, but posts NOTHING. " +
+          "Required before post_journal_entry will succeed (same journalEntryId, within 15 minutes). Show this " +
+          "briefing to the user and get their explicit go-ahead before calling post_journal_entry - never chain " +
+          "straight from preview to post without the user confirming in between.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          journalEntryId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, journalEntryId }) => {
+        const listResult = await this.call("preview_journal_entry_posting", businessProfileId, "accounting.listJournalEntries", { businessProfileId });
+        if (listResult.isError) return listResult;
+        let briefing: unknown = null;
+        try {
+          const parsed = JSON.parse(listResult.content[0].text) as { entries?: any[] };
+          briefing = (parsed.entries || []).find((e) => e.id === journalEntryId) ?? null;
+        } catch {
+          // fall through with briefing = null
+        }
+        if (!briefing) {
+          return { content: [{ type: "text", text: `Journal entry ${journalEntryId} not found.` }], isError: true };
+        }
+        this.sql`INSERT OR REPLACE INTO journal_posting_previews (journal_entry_id, previewed_at) VALUES (${journalEntryId}, ${Date.now()})`;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                previewOnly: true,
+                nothingPosted: true,
+                entry: briefing,
+                instructions: "Show this to the user. Only call post_journal_entry after they explicitly confirm.",
+              }),
+            },
+          ],
+        };
+      },
+    );
+
+    this.server.registerTool(
+      "post_journal_entry",
+      {
+        description:
+          "Post a draft journal entry to the ledger - a REAL, immediate write, not reversible via this tool. " +
+          "Requires a connection with full_post permission tier, AND a matching preview_journal_entry_posting " +
+          "call for the exact same journalEntryId within the last 15 minutes, AND the user has explicitly " +
+          "confirmed after seeing that preview. Never call this speculatively or without the user's explicit " +
+          "go-ahead. After posting, give the user a short briefing of exactly what was posted.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          journalEntryId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, journalEntryId }) => {
+        const rows = this.sql<{ previewed_at: number }>`
+          SELECT previewed_at FROM journal_posting_previews WHERE journal_entry_id = ${journalEntryId}
+        `;
+        const previewedAt = rows[0]?.previewed_at;
+        if (!previewedAt || Date.now() - previewedAt > PREVIEW_TTL_MS) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  "No recent preview found for this journalEntryId. Call preview_journal_entry_posting first, " +
+                  "show the result to the user, and get their explicit confirmation before calling " +
+                  "post_journal_entry again.",
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const result = await this.call("post_journal_entry", businessProfileId, "accounting.postJournalEntry", { journalEntryId });
+        this.sql`DELETE FROM journal_posting_previews WHERE journal_entry_id = ${journalEntryId}`;
+        return result;
+      },
     );
 
     this.server.registerTool(
@@ -316,6 +510,64 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
       },
     );
 
+    const updateBankTxDataSchema = z.object({
+      date: z.string().optional().describe("ISO date, YYYY-MM-DD"),
+      description: z.string().optional(),
+      amount: z.number().optional().describe("Positive number, same convention as import_bank_statement"),
+      currency: z.string().optional(),
+      type: z.enum(["income", "expense"]).optional(),
+      counterparty: z.string().optional(),
+      counterpartyName: z.string().optional(),
+      counterpartyIban: z.string().optional(),
+      category: z.string().optional(),
+    });
+
+    this.server.registerTool(
+      "update_bank_transaction",
+      {
+        description:
+          "Correct a bank transaction's own fields (e.g. a bad import — wrong date/amount/description/" +
+          "counterparty). Requires draft_write or full_post tier. Rejected if the transaction's status is " +
+          "posted or reconciled - reverse the journal entry first. Does NOT touch status/classification/" +
+          "journal_entry_id - use classify_bank_transaction or the post/preview tools for those.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          bankTransactionId: z.string().uuid(),
+          data: updateBankTxDataSchema,
+        },
+      },
+      async ({ businessProfileId, bankTransactionId, data }) => {
+        const patch: Record<string, unknown> = {
+          date: data.date,
+          description: data.description,
+          amount: data.amount,
+          currency: data.currency,
+          type: data.type,
+          counterparty: data.counterparty,
+          counterparty_name: data.counterpartyName,
+          counterparty_iban: data.counterpartyIban,
+          category: data.category,
+        };
+        return this.callBank("update_bank_transaction", businessProfileId, "update-transaction", { bankTransactionId, data: patch });
+      },
+    );
+
+    this.server.registerTool(
+      "delete_bank_transaction",
+      {
+        description:
+          "Permanently delete a bank transaction row (e.g. a duplicate or bad import). Requires draft_write or " +
+          "full_post tier. Rejected if the transaction's status is posted or reconciled - reverse the journal " +
+          "entry and void it first. Not reversible via this tool.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          bankTransactionId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, bankTransactionId }) =>
+        this.callBank("delete_bank_transaction", businessProfileId, "delete-transaction", { bankTransactionId }),
+    );
+
     this.server.registerTool(
       "classify_bank_transaction",
       {
@@ -436,6 +688,61 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
           ],
         };
       },
+    );
+
+    // MCP "prompt" (distinct from tools - a reusable workflow template a
+    // client can surface directly to the user, e.g. as a slash command in
+    // Claude Desktop) for the OCR -> add_expense_invoice workflow. Doesn't
+    // do any OCR itself - it never sees the document - it just tells the
+    // calling model exactly which fields to extract and how to call
+    // add_expense_invoice, since that tool's own description can't carry
+    // this much step-by-step guidance without bloating every tools/list
+    // response. businessProfileId is optional: if the client doesn't know
+    // it yet, the returned message tells the model to call
+    // list_business_profiles first.
+    this.server.registerPrompt(
+      "add_expense_from_document",
+      {
+        title: "Add expense from a receipt/invoice image",
+        description:
+          "Walks the model through reading a receipt, invoice, or expense document (already attached to the " +
+          "conversation, e.g. an image or PDF) and recording it in ksiegai as a cost/expense invoice via " +
+          "add_expense_invoice. Requires a connection with draft_write or full_post tier.",
+        argsSchema: {
+          businessProfileId: z.string().uuid().optional().describe("If already known - otherwise the model will call list_business_profiles first"),
+        },
+      },
+      async ({ businessProfileId }) => ({
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text:
+                "Read the receipt/invoice/expense document attached to this conversation and record it in " +
+                "ksiegai as a cost/expense invoice. Steps:\n\n" +
+                "1. " +
+                (businessProfileId
+                  ? `Use businessProfileId ${businessProfileId}.`
+                  : "Call list_business_profiles to get the businessProfileId (there's exactly one for this connection).") +
+                "\n" +
+                "2. Read the document yourself (you have vision - this MCP server does no OCR) and extract: " +
+                "supplier name, supplier NIP if shown, issue date, due date if shown, currency, and each line " +
+                "item (name, quantity if shown, unit price if shown, VAT rate as a percent - use vatExempt:true " +
+                "instead of a rate for VAT-exempt items, and net/vat/gross totals if the document shows them " +
+                "explicitly rather than computing them yourself).\n" +
+                "3. Call add_expense_invoice with those fields. Do not guess or invent any value the document " +
+                "doesn't actually show - leave optional fields out instead.\n" +
+                "4. The invoice always lands as needs_review, pending acceptance - it is never auto-posted to " +
+                "the ledger. Tell the user it's saved and awaiting their review in ksiegai, and mention the " +
+                "extracted supplier name and gross total so they can sanity-check it at a glance.\n" +
+                "5. If the document is illegible, ambiguous, or missing required fields (supplier name, issue " +
+                "date, at least one line item), say so instead of guessing - do not call add_expense_invoice " +
+                "with fabricated data.",
+            },
+          },
+        ],
+      }),
     );
   }
 }

@@ -19,6 +19,21 @@
   // this Worker touching Postgres or re-implementing anything.
   "services": [{ "binding": "GATEWAY", "service": "ksiegai-gateway" }],
 
+  // OAuth auto-connect (T-418 continuation, 2026-08-15): @cloudflare/workers-oauth-provider's
+  // grant/token/pending-authorize-request store. Placeholder id — before a
+  // real deploy, run `wrangler kv namespace create ksiegai-mcp-oauth-kv`
+  // and replace "id" below. `wrangler dev` (local mode) doesn't need a real
+  // provisioned namespace to run — it simulates KV locally regardless.
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "REPLACE_WITH_REAL_KV_NAMESPACE_ID" }],
+
+  // Where the OAuth /authorize handler redirects the browser to for the
+  // actual login + business/tier consent screen (McpAuthorize.tsx in
+  // ksef-ai) — see src/oauth.ts. Not a secret; overridable via .dev.vars
+  // for local dev against a local ksef-ai dev server.
+  "vars": {
+    "APP_AUTHORIZE_URL": "https://app.ksiegai.pl/settings/ai-mcp/authorize"
+  },
+
   "routes": [{ "pattern": "mcp.ksiegai.pl", "custom_domain": true }],
   "workers_dev": true,
 

@@ -193,12 +193,57 @@ already consumed)**. All test rows (bank transaction, import batch,
 journal entry/lines, and earlier the expense invoice + its supplier
 customer) deleted afterward to keep Tovernet's real data clean.
 
-**Not yet built/exposed** (genuine gaps, not tested because they don't
-exist): `draft_journal_entry`/`post_journal_entry` for manual (non-bank-
-transaction) journal entries from the original design, `get_posting_queue`
-(posting queue is still a direct multi-table client-side aggregation, not
-ported to `ksiegai-workspace` yet), contract reads, `post-bank-transaction-rc`
-(the reverse-charge posting variant — only the plain one has a tool so far).
+**Not yet built/exposed** (genuine gaps): contract reads,
+`post-bank-transaction-rc` (the reverse-charge posting variant — only the
+plain one has a tool so far), `setup_chart_of_accounts`.
+
+## Pass 2 (2026-08-15): 8 new tools — T-418 continuation
+
+Plan approved same day (accounting expansion: posting queue, period
+report/ledger, bank transaction CRUD gaps, manual journal entries), built
+in that order:
+
+- `get_posting_queue` — every unposted/needs-review invoice/contract/
+  loan-repayment/bank-transaction/Stripe-settlement, with a suggested
+  posting template each. Wraps new `accounting.getPostingQueue` (ports
+  `postingQueueRepository.ts`'s read side, two documented simplifications
+  — see that route file's header).
+- `get_period_report` — real P&L for one month (revenue/expense totals,
+  net result, per-account breakdown). Wraps new `accounting.getPeriodReport`
+  — built from `get_account_balances`'s `month_delta`, NOT a port of the
+  frontend's `ProfitLoss.tsx`, which uses fixed made-up percentage splits
+  rather than real per-account data.
+- `list_journal_entries` — the general ledger (`journal_entries_with_lines`
+  view), filterable by status/date range/source_type. Wraps new
+  `accounting.listJournalEntries`.
+- `update_bank_transaction` / `delete_bank_transaction` — the CRUD gap:
+  bank accounts already had full CRUD, transactions only had list/import/
+  classify/post, no way to fix a bad import's own fields or remove a
+  duplicate. New `bank-api` actions `update-transaction`/`delete-transaction`,
+  both rejected once a transaction's status is `posted`/`reconciled` (delete
+  also backstopped by the existing `trg_prevent_posted_bank_tx_delete`
+  trigger). draft_write tier.
+- `draft_journal_entry` — manual journal entry (debits/credits validated to
+  balance within 0.01), for anything not covered by a bank transaction or
+  invoice. Wraps new `accounting.createJournalEntry` (ports
+  `journalRepository.ts`'s `createJournalEntry()` — same
+  `rpc_create_journal_entry`+`rpc_insert_journal_lines` sequence, same
+  rollback-on-line-failure). **Always** `entry_status='draft'`, same
+  never-auto-post posture as `add_expense_invoice`. draft_write tier.
+- `preview_journal_entry_posting` / `post_journal_entry` — same
+  confirm-before-post gate as `preview_bank_transaction_posting`/
+  `post_bank_transaction`, generalized to a second Durable-Object SQLite
+  table (`journal_posting_previews`, keyed on `journal_entry_id` alone).
+  Wraps new `accounting.postJournalEntry` (thin wrapper on
+  `rpc_post_journal_entry`, remaps its draft-only ERRCODE 22000 to a clean
+  409). full_post tier for the post half, draft_write for the preview half.
+
+**Not yet live-tested end-to-end** — mid-session, local Supabase's docker
+volume was found to have only 2 migrations applied (`20260422*`) against
+~150 files on disk through `20260815`; `bank_transactions` locally was
+missing `status`/`counterparty_name`/`counterparty_iban` entirely as a
+result. User is rehearsing the local DB separately; run the same live-test
+method as the Pass 1 tools (below) once that's done, then update this note.
 
 **Bugs found and fixed during this same live-test pass** (not caught by
 `tsc --noEmit`, only by actually calling the tools):
@@ -224,6 +269,102 @@ ported to `ksiegai-workspace` yet), contract reads, `post-bank-transaction-rc`
   directly against `journal_lines` — only the response payload is wrong).
   Documented, not fixed, in `ksef-ai/supabase/functions/bank-api/README_AGENT.md`.
 
+## Prompts
+
+Distinct MCP primitive from tools — a named, reusable workflow template a
+client can surface directly (e.g. as a slash command in Claude Desktop),
+registered via `McpServer.registerPrompt` (SDK 1.30.0+). Returns a
+`messages` array injected into the conversation for the model to act on
+with its own tools — the server itself never sees the document.
+
+- `add_expense_from_document(businessProfileId?)` — walks the model
+  through reading an already-attached receipt/invoice image/PDF (model's
+  own vision, no server-side OCR) and calling `add_expense_invoice` with
+  the extracted fields. Exists because that tool's own description can't
+  carry this much step-by-step guidance (which fields to extract, don't
+  fabricate missing ones, mention the extracted supplier/total back to the
+  user) without bloating every `tools/list` response. Same
+  never-auto-post posture as the tool it wraps.
+
+## OAuth auto-connect (2026-08-15)
+
+Real OAuth 2.1 authorization-code flow (`@cloudflare/workers-oauth-provider`,
+`src/index.ts` + `src/oauth.ts`) sitting *alongside*, not replacing, the
+manual `mcp_...` token flow above — an MCP client can now click "connect",
+have a browser open, log in / approve, and be connected automatically,
+instead of copy-pasting a token from Ustawienia. Pre-registered clients
+only (Claude Code, Claude Desktop, Codex) — no dynamic/self-service client
+registration.
+
+**Key design point**: OAuth is just another way to arrive at an
+`mcp_access_tokens` row — `completeAuthorization`'s `props` is
+`{ mcpTokenHash }`, the exact same shape the manual flow already produces.
+Every downstream piece (`mcp-agent.ts`, `gateway-client.ts`,
+`authenticateMcpCall`, the tier-check/audit-log system) is **completely
+unchanged** — this was the whole point of the design, see the migration
+`20260811120000_mcp_access_tokens.sql`'s own header comment, which
+predicted exactly this.
+
+```
+1. MCP client -> GET mcp.ksiegai.pl/authorize?client_id=...&redirect_uri=...
+2. src/oauth.ts's handleAuthorize: parseAuthRequest -> stash it in OAUTH_KV
+   under a random requestToken (10 min TTL) -> 302 to ksef-ai's
+   /settings/ai-mcp/authorize?requestToken=...&client=...
+3. McpAuthorize.tsx (ksef-ai) - login via the app's normal route guard if
+   needed, then the same business/tier/expiry picker McpConnect.tsx has -
+   on approve calls mcp.createConnection (now accepts an optional
+   oauthRequestToken) then does a plain top-level redirect to
+   mcp.ksiegai.pl/authorize/complete?requestToken=...
+4. src/oauth.ts's handleAuthorizeComplete: calls public-api's
+   mcp.resolveOAuthConnection (via the gateway, dedicated route, same
+   pattern as mcp.authenticate) with {requestToken} - that action
+   atomically claims the matching mcp_access_tokens row (single-use: it
+   nulls oauth_request_token on claim) and returns {tokenHash, userId,
+   businessProfileId, permissionTier}. Looks up the pending AuthRequest
+   from OAUTH_KV, calls completeAuthorization({request, userId,
+   props: {mcpTokenHash: tokenHash}, scope}) -> redirects to the MCP
+   client's own redirect_uri with a real code.
+5. Client exchanges the code at mcp.ksiegai.pl/oauth/token (library-
+   handled) for an access+refresh token. Every future /mcp call: the
+   library validates it, sets ctx.props = {mcpTokenHash}, calls the same
+   apiHandler as the manual path -> authenticateMcpCall's normal live
+   revocation/tier/audit check runs exactly as before.
+```
+
+`src/index.ts` branches on the bearer token BEFORE touching
+`OAuthProvider`: a `Bearer mcp_...` header takes the untouched legacy
+path (byte-for-byte the same code as before this pass); anything else
+(no token, or a real OAuth token) goes through `oauthProvider.fetch`,
+which owns `/authorize`, `/oauth/token`, and OAuth-token-validated `/mcp`
+calls.
+
+**No shared secret between this Worker and public-api** for the
+`/authorize/complete` -> `mcp.resolveOAuthConnection` hop — protection is
+the `requestToken`'s own entropy (32 random bytes) + single-use (claimed
+atomically, `oauth_request_token` nulled) + short TTL (10 min in
+`OAUTH_KV`), the same protection class as an OAuth authorization code
+itself. See that action's own header comment in ksef-ai's `mcp.actions.ts`
+for the full reasoning.
+
+**Client pre-registration**: `POST /admin/register-client`
+(`x-admin-secret: <MCP_ADMIN_SECRET>` header, gated by a Worker secret) ->
+calls `env.OAUTH_PROVIDER.createClient({clientId, clientName, redirectUris,
+tokenEndpointAuthMethod: 'none', grantTypes: [...]})`. Run once per client
+after deploy.
+
+**Not yet live-tested end-to-end** (same local-DB-rehearsal block as the
+accounting tools above) and **not deployable as-is**:
+`wrangler.jsonc`'s `OAUTH_KV` namespace id is a placeholder
+(`REPLACE_WITH_REAL_KV_NAMESPACE_ID`) — run
+`wrangler kv namespace create ksiegai-mcp-oauth-kv` and put the real id in
+before deploying. `wrangler deploy --dry-run` couldn't be verified in this
+dev environment either (hangs, apparently on Cloudflare auth needed to
+resolve/validate the KV namespace reference) — `tsc --noEmit` is clean and
+the code was reviewed line-by-line against `workers-oauth-provider`'s
+actual shipped `.d.ts` (not just its README, which was missing/wrong on a
+few signatures), but this hasn't been bundle-verified the way Pass 1/2's
+tools were.
+
 ## Local dev
 
 ```bash
@@ -241,16 +382,13 @@ instance if running locally, or its deployed version otherwise.
 
 1. ~~`mcp_access_tokens` + `mcp_audit_log` tables~~ — done 2026-08-11, see
    "Auth — Phase 1" above.
-2. OAuth auto-connect (browser auto-opens to an in-app authorize screen on
-   first connect, zero copy-paste) — deferred by the user 2026-08-11,
-   compatible with the Phase 1 foundation (see that section's last
-   paragraph). Would need `@cloudflare/workers-oauth-provider` + a new
-   `OAUTH_KV` namespace, restructuring `src/index.ts`'s flat fetch handler.
-3. Write tools: `draft_journal_entry` (always `entry_status='draft'`/
-   `needs_review`, never auto-posts), `post_journal_entry` (separate,
-   higher-trust call), `setup_chart_of_accounts`.
-4. More read tools: `list_invoices`, `get_invoice`, `list_contracts`,
-   `get_contract`, `get_posting_queue`, `get_account_balance`,
-   `get_trial_balance` — each needs a corresponding `ksiegai-workspace`
-   action if one doesn't already exist (most don't yet — only
-   `accounting.listChartAccounts` is live today).
+2. ~~OAuth auto-connect~~ — built 2026-08-15, see "OAuth auto-connect"
+   section below. **Not yet live-tested** (same local-DB-rehearsal block
+   as Pass 2's tools) and needs a real `OAUTH_KV` namespace + pre-registered
+   clients before it does anything in a real deploy — see that section.
+3. ~~Write tools: `draft_journal_entry`, `post_journal_entry`~~ — done
+   2026-08-15, see "Pass 2" above. `setup_chart_of_accounts` still not
+   built.
+4. ~~More read tools: `get_posting_queue`~~ — done 2026-08-15. Still not
+   built: `get_contract`/`list_contracts` (no corresponding
+   `ksiegai-workspace` action exists yet).

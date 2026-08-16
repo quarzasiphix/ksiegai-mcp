@@ -91,6 +91,40 @@ export async function authenticateMcpCall(
 }
 
 /**
+ * Resolves a pending OAuth authorize request (T-418 OAuth auto-connect,
+ * 2026-08-15) — called from src/oauth.ts's /authorize/complete handler
+ * once the user has approved the connection on ksiegai's consent screen
+ * (McpAuthorize.tsx). `requestToken` is the same opaque, single-use, short-
+ * TTL value this Worker generated and handed to that screen via the
+ * redirect in the first place — its own unguessability + single-use +
+ * short expiry IS the authorization here (same protection class as an
+ * OAuth authorization code itself), no separate shared secret needed.
+ * public-api's `mcp.resolveOAuthConnection` atomically claims the matching
+ * mcp_access_tokens row (clears its oauth_request_token so a replay 404s)
+ * and returns the connection's hash + owning user + business, which this
+ * Worker turns straight into completeAuthorization's `props` — identical
+ * shape to the manual mcp_... token path, so every downstream tool call
+ * still goes through the normal live authenticateMcpCall check.
+ */
+export async function resolveOAuthConnection(
+  env: Env,
+  requestToken: string,
+): Promise<{ tokenHash: string; userId: string; businessProfileId: string; agentName: string; permissionTier: string }> {
+  const response = await env.GATEWAY.fetch("https://internal/v1/public/mcp/resolve-oauth-connection", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ requestToken }),
+  });
+
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = body && typeof body === "object" && "error" in body ? JSON.stringify(body.error) : response.statusText;
+    throw new McpAuthError(response.status, message);
+  }
+  return (body as { data: { tokenHash: string; userId: string; businessProfileId: string; agentName: string; permissionTier: string } }).data;
+}
+
+/**
  * Calls ksiegai-gateway's `bank-api` proxy (POST /v1/banking,
  * { action: "kebab-case-verb", ...params } - note: kebab-case action name,
  * NOT the "domain.verb" shape callWorkspace uses; bank-api is a separate
