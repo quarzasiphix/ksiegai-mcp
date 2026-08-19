@@ -309,6 +309,34 @@ small file, confirm `list_company_documents` shows it, confirm
 `get_company_document` returns a signed URL that actually resolves the
 uploaded bytes.
 
+## Pass 4 (2026-08-17): team management tools
+
+`list_team_members`, `list_team_invitations`, `invite_team_member`,
+`resend_team_invitation`, `cancel_team_invitation`,
+`update_team_member_role`, `remove_team_member` — wrap the `team` domain's
+`ksiegai-workspace` routes (`ksef-ai/supabase/functions/ksiegai-workspace/
+domains/team/`), all RLS-scoped (`ctx.rlsSupabase`, no service-role
+bypass), same access boundary a human using Ustawienia -> Zespół already
+has. `invite_team_member` sends a real invite email (server-side, via
+`domains/team/lib/sendInvitationEmail.ts` — composes and sends directly
+through the shared email modules rather than hopping through admin-api's
+admin-gated `sendAdminEmail` action, which was the wrong boundary for a
+plain team owner/admin inviting someone).
+
+The 2 list tools are `read_only` tier; the 5 write ones are `draft_write`
+(added to `mcp.actions.ts`'s tier map) — not a ledger posting like
+`post_bank_transaction`/`post_journal_entry`, but a real side effect (an
+email to a third party, or an access-control change), so deliberately not
+`read_only`.
+
+**Not yet live-tested end-to-end** — same local-DB-rehearsal gap as Pass 2/3.
+Verify with a real MCP call: invite a test email, confirm
+`list_team_invitations` shows it pending, confirm the invite email actually
+arrives with a working `/invite/accept?token=...` link, resend, cancel,
+then on a real member confirm `update_team_member_role`/`remove_team_member`
+work and that removing/role-changing the owner is correctly rejected (RLS
++ the routes' own guards).
+
 ## Prompts
 
 Distinct MCP primitive from tools — a named, reusable workflow template a

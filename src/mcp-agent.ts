@@ -176,6 +176,96 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
     );
 
     this.server.registerTool(
+      "setup_chart_of_accounts",
+      {
+        description:
+          "Set up the starter chart of accounts (28-row Polish COA) for a business profile that doesn't have " +
+          "one yet, plus the account-key map (resolves semantic keys like BANK_MAIN/AR_CUSTOMERS/VAT_OUTPUT to " +
+          "specific account codes) that other posting tools rely on. Safe to call defensively before drafting " +
+          "journal entries for a new business - if a chart of accounts already exists, returns alreadyExists:true " +
+          "instead of an error. Requires draft_write or full_post permission tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId }) =>
+        this.call("setup_chart_of_accounts", businessProfileId, "accounting.setupChartOfAccounts", { businessProfileId }),
+    );
+
+    const ACCOUNT_TYPE_ENUM = z.enum(["asset", "liability", "equity", "revenue", "expense", "off_balance"]);
+
+    this.server.registerTool(
+      "create_chart_account",
+      {
+        description:
+          "Add a new account to this business profile's chart of accounts. Use setup_chart_of_accounts first if " +
+          "the profile has no chart of accounts at all. Requires draft_write or full_post permission tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          code: z.string().describe("Account code, e.g. '410' - convention is 3-digit Polish COA codes, see get_chart_of_accounts for existing codes"),
+          name: z.string(),
+          accountType: ACCOUNT_TYPE_ENUM,
+          parentId: z.string().uuid().optional().describe("Parent synthetic account, if this is a sub-account"),
+          isSynthetic: z.boolean().optional().describe("True for a grouping/summary account, not directly posted to"),
+          defaultVatRate: z.number().optional().describe("e.g. 23 for 23%"),
+          vatExempt: z.boolean().optional(),
+          description: z.string().optional(),
+        },
+      },
+      async ({ businessProfileId, code, name, accountType, parentId, isSynthetic, defaultVatRate, vatExempt, description }) =>
+        this.call("create_chart_account", businessProfileId, "accounting.createChartAccount", {
+          businessProfileId, code, name, accountType, parentId, isSynthetic, defaultVatRate, vatExempt, description,
+        }),
+    );
+
+    this.server.registerTool(
+      "update_chart_account",
+      {
+        description:
+          "Edit an existing chart-of-accounts entry (partial update - only pass fields you want to change). Also " +
+          "used to reactivate a previously deactivated account (isActive: true). Requires draft_write or full_post " +
+          "permission tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          chartAccountId: z.string().uuid(),
+          code: z.string().optional(),
+          name: z.string().optional(),
+          accountType: ACCOUNT_TYPE_ENUM.optional(),
+          parentId: z.string().uuid().optional(),
+          isSynthetic: z.boolean().optional(),
+          defaultVatRate: z.number().optional(),
+          vatExempt: z.boolean().optional(),
+          description: z.string().optional(),
+          isActive: z.boolean().optional().describe("Set true to reactivate a deactivated account"),
+        },
+      },
+      async ({ businessProfileId, chartAccountId, ...patch }) =>
+        this.call("update_chart_account", businessProfileId, "accounting.updateChartAccount", {
+          businessProfileId, chartAccountId, ...patch,
+        }),
+    );
+
+    this.server.registerTool(
+      "deactivate_chart_account",
+      {
+        description:
+          "Soft-delete (deactivate) a chart-of-accounts entry - it stops appearing for new postings but its " +
+          "historical postings are unaffected and it can be reactivated later via update_chart_account. Blocked " +
+          "if the account is still referenced by any DRAFT (unposted) journal entry lines - resolve those first. " +
+          "Requires draft_write or full_post permission tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          chartAccountId: z.string().uuid(),
+          reason: z.string().optional(),
+        },
+      },
+      async ({ businessProfileId, chartAccountId, reason }) =>
+        this.call("deactivate_chart_account", businessProfileId, "accounting.deactivateChartAccount", {
+          businessProfileId, chartAccountId, reason,
+        }),
+    );
+
+    this.server.registerTool(
       "get_balance_sheet",
       {
         description:
@@ -783,6 +873,753 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
           ],
         };
       },
+    );
+
+    // Team management - wraps ksiegai-workspace's `team` domain (all
+    // RLS-scoped, no service-role bypass; see ksef-ai's
+    // ksiegai-workspace/domains/team/README-equivalent header comments on
+    // each route). invite_team_member/resend/cancel/update/remove are
+    // draft_write tier - not a ledger posting, but a real external side
+    // effect (an email to a third party) or an access-control change,
+    // deliberately gated the same as this project's other non-trivial
+    // writes rather than read_only.
+    const TEAM_ROLE_ENUM = z.enum(["admin", "accountant", "pelnomocnik", "viewer"]);
+
+    this.server.registerTool(
+      "list_team_members",
+      {
+        description: "List the members of a business profile's team (owner + everyone invited and accepted), with their role.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId }) =>
+        this.call("list_team_members", businessProfileId, "team.listMembers", { businessProfileId }),
+    );
+
+    this.server.registerTool(
+      "list_team_invitations",
+      {
+        description: "List all invitations sent for a business profile (pending, accepted, declined, expired, cancelled).",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId }) =>
+        this.call("list_team_invitations", businessProfileId, "team.listInvitations", { businessProfileId }),
+    );
+
+    this.server.registerTool(
+      "invite_team_member",
+      {
+        description:
+          "Invite someone to join a business profile's team by email - sends them a real invite email with an " +
+          "accept link. Requires draft_write or full_post permission tier. Roles: admin (full operational access, " +
+          "can invite others), accountant (invoices/expenses/documents/reports), pelnomocnik (documents + legal " +
+          "representation), viewer (read-only). Confirm the recipient's email and intended role with the user " +
+          "before calling this - it immediately sends a real email.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          email: z.string().email(),
+          role: TEAM_ROLE_ENUM,
+          message: z.string().optional().describe("Optional personal note included in the invite email"),
+        },
+      },
+      async ({ businessProfileId, email, role, message }) =>
+        this.call("invite_team_member", businessProfileId, "team.createInvitation", { businessProfileId, email, role, message }),
+    );
+
+    this.server.registerTool(
+      "resend_team_invitation",
+      {
+        description: "Resend the invite email for an existing pending invitation (same link/token) - e.g. it got lost or spam-filtered.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          invitationId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, invitationId }) =>
+        this.call("resend_team_invitation", businessProfileId, "team.resendInvitation", { businessProfileId, invitationId }),
+    );
+
+    this.server.registerTool(
+      "cancel_team_invitation",
+      {
+        description: "Cancel a pending team invitation before it's accepted.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          invitationId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, invitationId }) =>
+        this.call("cancel_team_invitation", businessProfileId, "team.cancelInvitation", { businessProfileId, invitationId }),
+    );
+
+    this.server.registerTool(
+      "update_team_member_role",
+      {
+        description:
+          "Change an existing team member's role (also resets their permission preset to that role's defaults - " +
+          "see invite_team_member's description for what each role grants). Cannot change the owner's role.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          memberId: z.string().uuid(),
+          role: TEAM_ROLE_ENUM,
+        },
+      },
+      async ({ businessProfileId, memberId, role }) =>
+        this.call("update_team_member_role", businessProfileId, "team.updateMember", { businessProfileId, memberId, updates: { role } }),
+    );
+
+    this.server.registerTool(
+      "remove_team_member",
+      {
+        description:
+          "Remove a member from a business profile's team - they immediately lose access. Cannot remove the " +
+          "owner. Confirm with the user before calling this - it's not reversible from here (they'd need a new " +
+          "invitation to rejoin).",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          memberId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, memberId }) =>
+        this.call("remove_team_member", businessProfileId, "team.removeMember", { businessProfileId, memberId }),
+    );
+
+    // === Governance / uchwały / KSH-210 (T-418 continuation, 2026-08-18) ===
+    // See ~/.claude/plans/cozy-skipping-meadow.md for the full design. The
+    // resolutions/decisions/authority-chain machinery already existed
+    // (including KSH art. 210 §1 conflict detection) - these tools are the
+    // first time any of it is exposed to an AI agent.
+
+    this.server.registerTool(
+      "list_resolutions",
+      {
+        description:
+          "List uchwały (shareholder/board resolutions) for this business profile. Includes KSH art. 210 §1 " +
+          "proxy-appointment resolutions (resolutionType='article_210_proxy_appointment').",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          status: z.string().optional().describe("draft | adopted | executed"),
+          resolutionType: z.string().optional(),
+        },
+      },
+      async ({ businessProfileId, status, resolutionType }) =>
+        this.call("list_resolutions", businessProfileId, "spolka.listResolutions", { businessProfileId, status, resolutionType }),
+    );
+
+    this.server.registerTool(
+      "get_resolution",
+      {
+        description:
+          "Full detail for one uchwała: the resolution itself, per-voter vote records, and the latest cached " +
+          "quorum/pass-fail validation result.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          resolutionId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, resolutionId }) =>
+        this.call("get_resolution", businessProfileId, "spolka.getResolution", { businessProfileId, resolutionId }),
+    );
+
+    this.server.registerTool(
+      "list_decisions",
+      {
+        description:
+          "List decisions (the mandate/authorization layer behind resolutions - every contract/invoice/expense " +
+          "should trace back to one of these). decisionType is 'strategic_shareholders' (uchwała wspólników-level) " +
+          "or 'operational_board' (uchwała zarządu-level, must have a parent strategic decision).",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          status: z.string().optional().describe("draft | pending_approval | active | paused | amendment_pending | amended | revocation_pending | revoked | rejected | cancelled"),
+          category: z.string().optional(),
+          decisionType: z.enum(["strategic_shareholders", "operational_board"]).optional(),
+        },
+      },
+      async ({ businessProfileId, status, category, decisionType }) =>
+        this.call("list_decisions", businessProfileId, "spolka.listDecisions", { businessProfileId, status, category, decisionType }),
+    );
+
+    this.server.registerTool(
+      "get_decision",
+      {
+        description: "Single decision by id - the mandate/authorization row's full detail.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          decisionId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, decisionId }) =>
+        this.call("get_decision", businessProfileId, "spolka.getDecision", { businessProfileId, decisionId }),
+    );
+
+    this.server.registerTool(
+      "get_authority_chain",
+      {
+        description:
+          "The full strategic->mandate->board->execution-object authority chain for a contract/invoice/expense, " +
+          "plus its cached governance validation (whether a valid decision authorizes it, and whether it needs a " +
+          "KSH art. 210 §1 proxy resolution). Reads the cache only - call refresh_governance_validation first if " +
+          "you need this recomputed after a recent change.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          objectType: z.enum(["contract", "invoice", "expense"]),
+          objectId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, objectType, objectId }) =>
+        this.call("get_authority_chain", businessProfileId, "spolka.getAuthorityChain", { businessProfileId, objectType, objectId }),
+    );
+
+    this.server.registerTool(
+      "check_ksh_compliance_for_loan",
+      {
+        description:
+          "Check a shareholder/board-member loan against KSH (Kodeks spółek handlowych) art. 15 (board-member " +
+          "loan requires shareholder consent, no threshold), art. 210 §1 (if the counterparty is a board member, " +
+          "the company must be represented by the rada nadzorcza or a shareholder-appointed pełnomocnik - the " +
+          "board member can't sign for both sides), and art. 230 (loan exceeding 2x share capital needs consent). " +
+          "Returns which articles apply, whether each is satisfied, and an overall compliant flag. Use this " +
+          "before treating a shareholder loan as properly authorized.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          loanId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, loanId }) =>
+        this.call("check_ksh_compliance_for_loan", businessProfileId, "spolka.checkKshComplianceForLoan", { businessProfileId, loanId }),
+    );
+
+    this.server.registerTool(
+      "refresh_governance_validation",
+      {
+        description:
+          "Recompute the cached governance/authority-chain validation (incl. KSH art. 210 §1 conflict detection) " +
+          "for a contract/invoice/expense. Only updates a validation-cache table, doesn't change any real " +
+          "authorization - call this before get_authority_chain if you suspect the cached result is stale " +
+          "(e.g. after creating a new decision or proxy resolution).",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          objectType: z.enum(["contract", "invoice", "expense"]),
+          objectId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, objectType, objectId }) =>
+        this.call("refresh_governance_validation", businessProfileId, "spolka.refreshGovernanceValidation", { businessProfileId, objectType, objectId }),
+    );
+
+    this.server.registerTool(
+      "refresh_representation_validation",
+      {
+        description:
+          "Recompute who must sign/represent the company for a contract (incl. its own KSH art. 210 §1 proxy " +
+          "check) - a narrower sibling of refresh_governance_validation focused on signing authority rather than " +
+          "the full mandate chain. Only meaningful for contracts today.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          objectType: z.enum(["contract", "invoice", "expense", "company_document"]),
+          objectId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, objectType, objectId }) =>
+        this.call("refresh_representation_validation", businessProfileId, "spolka.refreshRepresentationValidation", { businessProfileId, objectType, objectId }),
+    );
+
+    this.server.registerTool(
+      "create_resolution",
+      {
+        description:
+          "Draft a new uchwała (shareholder/board resolution) - ALWAYS created as status='draft', never " +
+          "auto-adopted (adoption requires the real vote/quorum flow in the app). For a KSH art. 210 §1 proxy " +
+          "appointment (needed when a contract/loan involves a board member as counterparty), set " +
+          "resolutionType='article_210_proxy_appointment', adoptingBody='shareholders', and exactly one of " +
+          "article210ProxyShareholderId / article210ProxyRepresentativeBoardMemberId / " +
+          "article210ProxyRepresentativeExternalName to name who represents the company for that matter.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          resolutionNumber: z.string(),
+          resolutionType: z.string().describe("e.g. 'article_210_proxy_appointment', or any other resolution type used in this company"),
+          resolutionDate: z.string().describe("ISO date, YYYY-MM-DD"),
+          title: z.string(),
+          content: z.string().optional(),
+          fiscalYear: z.number().optional(),
+          amount: z.number().optional(),
+          adoptingBody: z.enum(["shareholders", "board"]).optional().describe("Defaults to 'shareholders'"),
+          meetingId: z.string().uuid().optional(),
+          article210ProxyShareholderId: z.string().uuid().optional(),
+          article210ProxyBoardMemberId: z.string().uuid().optional().describe("The board member this proxy resolution concerns (the conflicted party)"),
+          article210Scope: z.string().optional(),
+          article210ProxyRepresentativeType: z.enum(["shareholder", "board_member", "external"]).optional(),
+          article210ProxyRepresentativeBoardMemberId: z.string().uuid().optional(),
+          article210ProxyRepresentativeExternalName: z.string().optional(),
+          subjectEntityType: z.enum(["shareholder", "board_member", "company", "external_person"]).optional(),
+          subjectShareholderId: z.string().uuid().optional(),
+          subjectBoardMemberId: z.string().uuid().optional(),
+          subjectExternalName: z.string().optional(),
+        },
+      },
+      async ({ businessProfileId, ...rest }) =>
+        this.call("create_resolution", businessProfileId, "spolka.createResolution", { businessProfileId, ...rest }),
+    );
+
+    this.server.registerTool(
+      "create_decision",
+      {
+        description:
+          "Draft a new decision (mandate/authorization) - ALWAYS created as status='draft', never immediately " +
+          "active. A human must review and activate it in the app before it authorizes anything. decisionType " +
+          "'operational_board' requires parentDecisionId pointing at a 'strategic_shareholders' decision.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          title: z.string(),
+          decisionType: z.enum(["strategic_shareholders", "operational_board"]),
+          category: z.enum([
+            "consents", "conflict_of_interest", "operational_activity", "company_financing", "compensation",
+            "sales_services", "operational_costs", "fixed_asset_acquisition", "lending_for_use_contracts",
+            "vehicle_purchase", "vehicle_rental", "vehicle_sale", "b2b_contracts", "cash_management",
+            "project_governance", "custom_projects", "other",
+          ]),
+          resolutionId: z.string().uuid().optional().describe("The uchwała this decision derives from, if any"),
+          parentDecisionId: z.string().uuid().optional(),
+          description: z.string().optional(),
+          scopeDescription: z.string().optional(),
+          amountLimit: z.number().optional(),
+          currency: z.string().optional(),
+          validFrom: z.string().optional().describe("ISO date"),
+          validTo: z.string().optional().describe("ISO date"),
+          allowedCounterparties: z.array(z.object({ name: z.string(), nip: z.string().optional() })).optional(),
+          decisionBody: z.enum(["ZARZAD", "WSPOLNICY"]).optional().describe("Defaults to 'WSPOLNICY'"),
+          authorityLevel: z.enum(["shareholders", "board", "manager"]).optional(),
+          legalReference: z.string().optional(),
+        },
+      },
+      async ({ businessProfileId, ...rest }) =>
+        this.call("create_decision", businessProfileId, "spolka.createDecision", { businessProfileId, ...rest }),
+    );
+
+    this.server.registerTool(
+      "pause_decision",
+      {
+        description:
+          "Freeze an active decision without revoking it - blocks it from authorizing new actions while flagged " +
+          "for review, reversibly (unlike revocation, which goes through an approval chain). Use this when you " +
+          "suspect a decision is being relied on incorrectly (e.g. missing an art. 210 proxy) and want to stop " +
+          "further action on it pending human review. Requires draft_write or full_post permission tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          decisionId: z.string().uuid(),
+          reason: z.string().optional(),
+        },
+      },
+      async ({ businessProfileId, decisionId, reason }) =>
+        this.call("pause_decision", businessProfileId, "spolka.pauseDecision", { businessProfileId, decisionId, reason }),
+    );
+
+    this.server.registerTool(
+      "resume_decision",
+      {
+        description:
+          "Restore a paused decision back to active, letting it authorize actions again. Higher trust than " +
+          "pause_decision (restoring authority is the risk-increasing direction) - requires full_post permission " +
+          "tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          decisionId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, decisionId }) =>
+        this.call("resume_decision", businessProfileId, "spolka.resumeDecision", { businessProfileId, decisionId }),
+    );
+
+    // === Contracts, all types (T-418 continuation, 2026-08-18) ===
+
+    const CONTRACT_TYPE_ENUM = z.enum([
+      "general", "employment", "service", "lease", "rental", "lending_for_use", "loan",
+      "loan_shareholder", "capital_contribution", "purchase", "board_member",
+      "management_board", "supervisory_board", "nda", "partnership", "other",
+    ]);
+
+    this.server.registerTool(
+      "list_contracts",
+      {
+        description: "List all contracts for this business profile (any contract type).",
+        inputSchema: { businessProfileId: z.string().uuid() },
+      },
+      async ({ businessProfileId }) =>
+        this.call("list_contracts", businessProfileId, "contracts.listByBusinessProfile", { businessProfileId }),
+    );
+
+    this.server.registerTool(
+      "get_contract",
+      {
+        description: "Single contract by id, full detail.",
+        inputSchema: { businessProfileId: z.string().uuid(), contractId: z.string().uuid() },
+      },
+      async ({ businessProfileId, contractId }) =>
+        this.call("get_contract", businessProfileId, "contracts.getContract", { businessProfileId, contractId }),
+    );
+
+    this.server.registerTool(
+      "create_contract",
+      {
+        description:
+          "Create a contract of any type (general, employment, service, lease, rental, lending_for_use, loan, " +
+          "loan_shareholder, capital_contribution, purchase, board_member, management_board, supervisory_board, " +
+          "nda, partnership, other). ALWAYS created inert (lifecycle_state='draft') regardless of what you " +
+          "specify - a human must review and activate it in the app. If boardMemberId is set, the response " +
+          "includes a warning to check_ksh_compliance_for_loan / get_authority_chain before treating it as " +
+          "authorized (KSH art. 210 §1 may require a proxy resolution). If decisionId is set, it must belong to " +
+          "this business profile and be an active decision - otherwise the call is rejected. Requires " +
+          "draft_write or full_post permission tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          contractType: CONTRACT_TYPE_ENUM,
+          number: z.string().optional().describe("Contract number/reference; auto-generated if omitted"),
+          customerId: z.string().uuid().optional(),
+          issueDate: z.string().optional().describe("ISO date, defaults to today"),
+          validFrom: z.string().optional().describe("ISO date, defaults to today"),
+          validTo: z.string().optional(),
+          subject: z.string().optional(),
+          content: z.string().optional(),
+          startDate: z.string().optional(),
+          endDate: z.string().optional(),
+          expectedTotalValue: z.number().optional(),
+          expectedMonthlyValue: z.number().optional(),
+          billingFrequency: z.string().optional(),
+          currency: z.string().optional().describe("Defaults to PLN"),
+          paymentTerms: z.number().optional().describe("Days, defaults to 14"),
+          boardMemberId: z.string().uuid().optional().describe("Set when the counterparty is a board member - triggers a KSH art. 210 warning"),
+          documentCategory: z.enum(["transactional_payout", "transactional_payin", "informational"]).optional(),
+          expectedAmount: z.number().optional(),
+          paymentFrequency: z.enum(["one_time", "monthly", "quarterly", "annual", "custom"]).optional(),
+          decisionId: z.string().uuid().optional().describe("Authorizing decision - must be active and belong to this business profile"),
+          decisionReference: z.string().optional(),
+          financingKind: z.enum(["none", "loan", "rental", "other"]).optional(),
+          loanSubtype: z.enum(["regular", "shareholder"]).optional(),
+          loanPartyType: z.enum(["shareholder", "bank", "b2b", "b2c", "other"]).optional(),
+        },
+      },
+      async ({ businessProfileId, ...rest }) =>
+        this.call("create_contract", businessProfileId, "contracts.create", { businessProfileId, ...rest }),
+    );
+
+    this.server.registerTool(
+      "update_contract",
+      {
+        description:
+          "Edit an existing contract (partial update - only pass fields you want to change). Does NOT support " +
+          "changing lifecycle_state (activation is a separate, not-yet-built capability) - this tool can only " +
+          "edit a contract's details, never move it out of draft. Requires draft_write or full_post permission " +
+          "tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          contractId: z.string().uuid(),
+          customerId: z.string().uuid().optional(),
+          subject: z.string().optional(),
+          content: z.string().optional(),
+          contractType: CONTRACT_TYPE_ENUM.optional(),
+          validTo: z.string().optional(),
+          startDate: z.string().optional(),
+          endDate: z.string().optional(),
+          expectedTotalValue: z.number().optional(),
+          expectedMonthlyValue: z.number().optional(),
+          expectedAmount: z.number().optional(),
+          boardMemberId: z.string().uuid().optional(),
+        },
+      },
+      async ({ businessProfileId, contractId, ...patch }) =>
+        this.call("update_contract", businessProfileId, "contracts.update", { businessProfileId, contractId, ...patch }),
+    );
+
+    // === Compliance checklist tasks (T-418 continuation, 2026-08-18) ===
+    // "What compliance deadlines does this company still have outstanding" —
+    // CRBR, konto organizacji, ZAW-FA, e-Doręczenia, KSeF activation, etc.
+    // (see checklist_rules seed data). list_checklist_tasks/list_checklist_rules
+    // wrap gateway routes that already existed (read-only, unused by MCP
+    // until now); update_checklist_task_status is a new write route.
+
+    this.server.registerTool(
+      "list_checklist_tasks",
+      {
+        description:
+          "List compliance checklist tasks for this business profile (CRBR, konto organizacji w e-Urząd " +
+          "Skarbowy, ZAW-FA, e-Doręczenia, KSeF activation, and other company-lifecycle deadlines). Each task " +
+          "has a status (todo/done/blocked/skipped/not_applicable) and, when relevant, a due_date. Use this to " +
+          "answer 'what compliance tasks are still outstanding for this company'.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          domain: z.string().optional().describe("Filter by domain, e.g. 'company'"),
+        },
+      },
+      async ({ businessProfileId, domain }) =>
+        this.call("list_checklist_tasks", businessProfileId, "personal.getChecklistTasks", { businessProfileId, domain }),
+    );
+
+    this.server.registerTool(
+      "list_checklist_rules",
+      {
+        description:
+          "List the active checklist rule definitions (the templates checklist tasks are generated from) - " +
+          "titles, descriptions, and which entity types/tax regimes each rule applies to. The rules themselves " +
+          "are global, not business-profile-scoped, but businessProfileId is still required (used for connection " +
+          "auth/tier checks, same as every other tool).",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          domain: z.string().optional().describe("Filter by domain, e.g. 'company'"),
+        },
+      },
+      async ({ businessProfileId, domain }) =>
+        this.call("list_checklist_rules", businessProfileId, "personal.getActiveChecklistRules", { domain }),
+    );
+
+    this.server.registerTool(
+      "update_checklist_task_status",
+      {
+        description:
+          "Mark a compliance checklist task's status (todo/done/blocked/skipped/not_applicable). Setting 'done' " +
+          "stamps completed_at/completed_by; moving away from 'done' clears them. Requires draft_write or " +
+          "full_post permission tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          taskId: z.string().uuid(),
+          status: z.enum(["todo", "done", "blocked", "skipped", "not_applicable"]),
+        },
+      },
+      async ({ businessProfileId, taskId, status }) =>
+        this.call("update_checklist_task_status", businessProfileId, "personal.updateChecklistTaskStatus", { businessProfileId, taskId, status }),
+    );
+
+    // === Stripe reconciliation (T-418 continuation, 2026-08-18) ===
+    // Owner-manual Stripe integration (a business's own Stripe API key,
+    // distinct from Stripe Connect hosted checkout). Flow: list_payment_provider_accounts
+    // to find paymentProviderAccountId -> import_stripe_fees/import_stripe_payouts
+    // to pull fresh data from Stripe's live API for a period -> list_stripe_fee_summaries/
+    // list_stripe_fee_items/list_stripe_payouts/get_stripe_period_settlement to
+    // review it (or check get_posting_queue, which already surfaces settlements
+    // needing posting with a concrete debit/credit template) -> draft_journal_entry
+    // + post_journal_entry to actually post -> link_stripe_settlement_journal_entry
+    // / link_stripe_fee_summary_journal_entry to close the loop so it stops
+    // reappearing as needing action.
+
+    this.server.registerTool(
+      "list_payment_provider_accounts",
+      {
+        description:
+          "List this business's connected payment provider accounts (Stripe, Revolut, etc. — owner-manual " +
+          "integrations, not Stripe Connect hosted checkout). Returns id, provider, display name, mode " +
+          "(test/live), and status - never secret/API-key values. Call this first to get paymentProviderAccountId, " +
+          "required by every other Stripe tool.",
+        inputSchema: { businessProfileId: z.string().uuid() },
+      },
+      async ({ businessProfileId }) =>
+        this.call("list_payment_provider_accounts", businessProfileId, "billing.listPaymentProviderAccounts", { businessProfileId }),
+    );
+
+    this.server.registerTool(
+      "import_stripe_fees",
+      {
+        description:
+          "Pull fresh fee data from Stripe's LIVE API for one account and month - scans every balance " +
+          "transaction in the period, upserts stripe_fee_items (idempotent, safe to re-run), and derives/updates " +
+          "the period's settlement (gross sales, refunds, fees, expected payout). May take a few seconds. " +
+          "Requires draft_write or full_post permission tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          paymentProviderAccountId: z.string().uuid(),
+          year: z.number().int(),
+          month: z.number().int().min(1).max(12),
+        },
+      },
+      async ({ businessProfileId, paymentProviderAccountId, year, month }) =>
+        this.call("import_stripe_fees", businessProfileId, "billing.importStripeFees", { businessProfileId, paymentProviderAccountId, year, month }),
+    );
+
+    this.server.registerTool(
+      "import_stripe_payouts",
+      {
+        description:
+          "Pull fresh payout data from Stripe's LIVE API for one account and month - upserts stripe_payouts and " +
+          "stripe_payout_items (idempotent, safe to re-run). May take a few seconds. Requires draft_write or " +
+          "full_post permission tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          paymentProviderAccountId: z.string().uuid(),
+          year: z.number().int(),
+          month: z.number().int().min(1).max(12),
+        },
+      },
+      async ({ businessProfileId, paymentProviderAccountId, year, month }) =>
+        this.call("import_stripe_payouts", businessProfileId, "billing.importStripePayouts", { businessProfileId, paymentProviderAccountId, year, month }),
+    );
+
+    this.server.registerTool(
+      "list_stripe_fee_summaries",
+      {
+        description:
+          "List monthly Stripe fee summaries (one per account per month) - total fees, reverse-charge VAT, and " +
+          "posting status (draft/posted/needs_review/confirmed).",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          paymentProviderAccountId: z.string().uuid().optional(),
+          status: z.enum(["draft", "posted", "needs_review", "confirmed"]).optional(),
+        },
+      },
+      async ({ businessProfileId, paymentProviderAccountId, status }) =>
+        this.call("list_stripe_fee_summaries", businessProfileId, "billing.listStripeFeeSummaries", { businessProfileId, paymentProviderAccountId, status }),
+    );
+
+    this.server.registerTool(
+      "list_stripe_fee_items",
+      {
+        description: "List the individual fee line items behind one monthly fee summary (from list_stripe_fee_summaries).",
+        inputSchema: { businessProfileId: z.string().uuid(), summaryId: z.string().uuid() },
+      },
+      async ({ businessProfileId, summaryId }) =>
+        this.call("list_stripe_fee_items", businessProfileId, "billing.listStripeFeeItems", { summaryId }),
+    );
+
+    this.server.registerTool(
+      "get_stripe_period_settlement",
+      {
+        description:
+          "Full reconciliation detail for one account+month: gross sales, refunds, disputes, Stripe fees, " +
+          "reverse-charge VAT, expected payout, and which journal entries (if any) have posted the sale/fee " +
+          "legs. get_posting_queue already surfaces settlements needing posting with a ready debit/credit " +
+          "template - use this tool for direct lookup of a specific period instead.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          paymentProviderAccountId: z.string().uuid(),
+          periodYear: z.number().int(),
+          periodMonth: z.number().int().min(1).max(12),
+        },
+      },
+      async ({ businessProfileId, paymentProviderAccountId, periodYear, periodMonth }) =>
+        this.call("get_stripe_period_settlement", businessProfileId, "billing.getStripePeriodSettlement", { businessProfileId, paymentProviderAccountId, periodYear, periodMonth }),
+    );
+
+    this.server.registerTool(
+      "list_stripe_payouts",
+      {
+        description:
+          "List Stripe payouts (transfers to the business's bank account) - amount, arrival date, and whether " +
+          "it's been matched to a bank transaction yet.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          paymentProviderAccountId: z.string().uuid().optional(),
+          bankMatchStatus: z.enum(["awaiting", "matched", "manual_confirmed"]).optional(),
+          limit: z.number().int().optional(),
+        },
+      },
+      async ({ businessProfileId, paymentProviderAccountId, bankMatchStatus, limit }) =>
+        this.call("list_stripe_payouts", businessProfileId, "billing.listStripePayouts", { businessProfileId, paymentProviderAccountId, bankMatchStatus, limit }),
+    );
+
+    this.server.registerTool(
+      "list_stripe_payout_items",
+      {
+        description: "List the individual payments/fees/refunds/adjustments that make up one Stripe payout (from list_stripe_payouts).",
+        inputSchema: { businessProfileId: z.string().uuid(), stripePayoutId: z.string().uuid() },
+      },
+      async ({ businessProfileId, stripePayoutId }) =>
+        this.call("list_stripe_payout_items", businessProfileId, "billing.listStripePayoutItems", { stripePayoutId }),
+    );
+
+    this.server.registerTool(
+      "link_stripe_settlement_journal_entry",
+      {
+        description:
+          "After posting a journal entry for a Stripe settlement's sale or fee leg (via draft_journal_entry + " +
+          "post_journal_entry, using get_posting_queue's template), call this to record the link and update the " +
+          "settlement's status - otherwise it keeps reappearing in get_posting_queue forever. A settlement can " +
+          "need both a sale and a fee entry; status only becomes 'posted' once both applicable legs are linked.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          settlementId: z.string().uuid(),
+          subKind: z.enum(["sale", "fee"]),
+          journalEntryId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, settlementId, subKind, journalEntryId }) =>
+        this.call("link_stripe_settlement_journal_entry", businessProfileId, "billing.linkStripeSettlementJournalEntry", { settlementId, subKind, journalEntryId }),
+    );
+
+    this.server.registerTool(
+      "link_stripe_fee_summary_journal_entry",
+      {
+        description:
+          "After posting a journal entry for a Stripe monthly fee summary (via draft_journal_entry + " +
+          "post_journal_entry), call this to mark the summary as posted and record the link.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          summaryId: z.string().uuid(),
+          journalEntryId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, summaryId, journalEntryId }) =>
+        this.call("link_stripe_fee_summary_journal_entry", businessProfileId, "billing.linkStripeFeeSummaryJournalEntry", { businessProfileId, summaryId, journalEntryId }),
+    );
+
+    this.server.registerTool(
+      "list_stripe_invoice_payments",
+      {
+        description:
+          "List recent Stripe Connect invoice payments (hosted checkout, not the fee/payout reconciliation " +
+          "tables above) for this business, each already resolved to its ksiegai invoice number and customer " +
+          "name where applicable - use this to answer 'which invoice did this Stripe payment pay' or 'has " +
+          "invoice X been paid via Stripe'. Most recent 20.",
+        inputSchema: { businessProfileId: z.string().uuid() },
+      },
+      async ({ businessProfileId }) =>
+        this.call("list_stripe_invoice_payments", businessProfileId, "billing.getStripePaymentTransactions", { businessProfileId }),
+    );
+
+    this.server.registerTool(
+      "match_stripe_payout_to_bank_transaction",
+      {
+        description:
+          "Bank-transfer matching: for Stripe payouts still awaiting a match (or one specific payoutDbId), " +
+          "looks for a bank_transactions row within ±4 days of the payout's arrival date with a matching amount " +
+          "and links them (bank_match_status -> 'matched'). Requires draft_write or full_post permission tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          payoutDbId: z.string().uuid().optional().describe("Omit to attempt matching for every awaiting payout"),
+        },
+      },
+      async ({ businessProfileId, payoutDbId }) =>
+        this.call("match_stripe_payout_to_bank_transaction", businessProfileId, "billing.matchStripePayoutToBankTransaction", { businessProfileId, payoutDbId }),
+    );
+
+    this.server.registerTool(
+      "auto_classify_stripe_bank_transactions",
+      {
+        description:
+          "Auto-classify unclassified expense bank transactions that look like Stripe transfers (counterparty/" +
+          "description containing 'stripe') - only acts for VAT-exempt business profiles (returns classified:0 " +
+          "otherwise, by design). Requires draft_write or full_post permission tier.",
+        inputSchema: { businessProfileId: z.string().uuid() },
+      },
+      async ({ businessProfileId }) =>
+        this.call("auto_classify_stripe_bank_transactions", businessProfileId, "billing.autoClassifyStripeBankTransactions", { businessProfileId }),
+    );
+
+    this.server.registerTool(
+      "confirm_stripe_payout",
+      {
+        description:
+          "Manually confirm a Stripe payout (bank_match_status -> 'matched' if bankTransactionId given, else " +
+          "'manual_confirmed') and record its financial_event. This is a bookkeeping record, not a journal " +
+          "entry - still use draft_journal_entry/post_journal_entry separately for the actual GL posting. " +
+          "Requires draft_write or full_post permission tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          stripePayoutDbId: z.string().uuid(),
+          bankTransactionId: z.string().uuid().optional(),
+        },
+      },
+      async ({ businessProfileId, stripePayoutDbId, bankTransactionId }) =>
+        this.call("confirm_stripe_payout", businessProfileId, "billing.confirmStripePayout", { businessProfileId, stripePayoutDbId, bankTransactionId }),
     );
 
     // MCP "prompt" (distinct from tools - a reusable workflow template a
