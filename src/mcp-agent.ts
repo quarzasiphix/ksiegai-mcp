@@ -524,10 +524,54 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
           sellDate: z.string().optional(),
           currency: z.string().optional(),
           comments: z.string().optional(),
+          bankAccountId: z.string().uuid().optional().describe("From list_bank_accounts - the account this expense should be paid from, if known"),
           items: z.array(expenseItemSchema).min(1),
         },
       },
       async (params) => this.call("add_expense_invoice", params.businessProfileId, "invoices.createExpense", params),
+    );
+
+    const incomeItemSchema = z.object({
+      name: z.string().optional(),
+      quantity: z.number().optional(),
+      unitPrice: z.number().optional(),
+      vatRate: z.number().describe("Percent, e.g. 23. Use -1 or vatExempt:true for zw (VAT-exempt)."),
+      vatExempt: z.boolean().optional(),
+      unit: z.string().optional(),
+      totalNetValue: z.number().optional(),
+      totalVatValue: z.number().optional(),
+      totalGrossValue: z.number().optional(),
+    });
+
+    this.server.registerTool(
+      "add_income_invoice",
+      {
+        description:
+          "Record a sales/income invoice for a customer (e.g. one the caller was asked to prepare, or already " +
+          "read structured fields for from a quote/order the user provided - this tool does no OCR/extraction " +
+          "itself). Requires a connection with draft_write or full_post permission tier. Always lands with " +
+          "posting_status/accounting_status='needs_review' and acceptance_status='pending', and NEVER touches " +
+          "KSeF submission - it is never auto-posted to the ledger, never auto-accepted, and never auto-submitted " +
+          "to KSeF, regardless of input. A human reviews it in ksiegai's normal invoice/posting queue, and KSeF " +
+          "submission remains a separate explicit action in the app.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          customerName: z.string(),
+          customerTaxId: z.string().optional().describe("NIP, if known - used to match/dedupe the customer"),
+          customerAddress: z.string().optional(),
+          customerPostalCode: z.string().optional(),
+          customerCity: z.string().optional(),
+          number: z.string().optional().describe("Invoice number, if the caller wants to assign one explicitly"),
+          issueDate: z.string().describe("ISO date, YYYY-MM-DD"),
+          dueDate: z.string().optional(),
+          sellDate: z.string().optional(),
+          currency: z.string().optional(),
+          comments: z.string().optional(),
+          bankAccountId: z.string().uuid().optional().describe("From list_bank_accounts - the account this invoice's payment should be received into, if known"),
+          items: z.array(incomeItemSchema).min(1),
+        },
+      },
+      async (params) => this.call("add_income_invoice", params.businessProfileId, "invoices.createIncome", params),
     );
 
     const documentCategorySchema = z
@@ -632,13 +676,71 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
       {
         description:
           "List bank transactions for one bank account (from list_bank_accounts) - includes classification, " +
-          "status (imported/needs_review/matched/posted/etc), and amounts.",
+          "status (imported/needs_review/matched/posted/etc), and amounts. Defaults to the 200 most recent " +
+          "transactions with no other filtering - narrow with startDate/endDate for a date range, or " +
+          "status/classification/direction to answer things like 'unclassified transactions from June' or " +
+          "'all expense payments last quarter'.",
         inputSchema: {
           businessProfileId: z.string().uuid().describe("This connection's business profile - not forwarded to the bank query itself, only used to authorize the call"),
           accountId: z.string().uuid(),
+          startDate: z.string().optional().describe("ISO date, YYYY-MM-DD, inclusive"),
+          endDate: z.string().optional().describe("ISO date, YYYY-MM-DD, inclusive"),
+          status: z.enum(["imported", "needs_review", "matched", "posted", "reconciled"]).optional(),
+          classification: z.enum([
+            "invoice_payment", "expense_payment", "foreign_service_purchase", "shareholder_loan",
+            "bank_loan", "loan_granted", "loan_repayment_received", "capital_contribution",
+            "stripe_payout", "tax_payment", "salary", "bank_transfer", "fee", "other",
+            "technical_verification_deposit", "technical_verification_reversal",
+          ]).optional(),
+          direction: z.enum(["credit", "debit"]).optional().describe("credit = money in (income), debit = money out (expense)"),
+          limit: z.number().int().min(1).max(500).optional().describe("Defaults to 200, capped at 500"),
         },
       },
-      async ({ businessProfileId, accountId }) => this.callBank("list_bank_transactions", businessProfileId, "list-transactions", { accountId }),
+      async ({ businessProfileId, accountId, startDate, endDate, status, classification, direction, limit }) =>
+        this.callBank("list_bank_transactions", businessProfileId, "list-transactions", { accountId, startDate, endDate, status, classification, direction, limit }),
+    );
+
+    this.server.registerTool(
+      "find_bank_match_candidates",
+      {
+        description:
+          "For one bank transaction (from list_bank_transactions), find candidate unpaid invoices (or, if the " +
+          "transaction looks like a Stripe payout, candidate Stripe payouts) it could settle - scored by amount " +
+          "and description match. Read-only, does not create a match itself - pass the chosen candidate's " +
+          "invoiceId/stripePayoutDbId into match_bank_transaction_to_invoice (invoices) or " +
+          "match_stripe_payout_to_bank_transaction (Stripe payouts) to actually link it.",
+        inputSchema: {
+          businessProfileId: z.string().uuid().describe("Not forwarded to the query, only used to authorize the call"),
+          bankTransactionId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, bankTransactionId }) =>
+        this.callBank("find_bank_match_candidates", businessProfileId, "find-match-candidates", { bankTransactionId }),
+    );
+
+    this.server.registerTool(
+      "match_bank_transaction_to_invoice",
+      {
+        description:
+          "Link a bank transaction to the invoice (or expense) it pays - the transaction flips to status " +
+          "'matched'. Use find_bank_match_candidates first to get a scored invoiceId and confidence rather than " +
+          "guessing. Requires a connection with draft_write or full_post permission tier.",
+        inputSchema: {
+          businessProfileId: z.string().uuid().describe("Not forwarded to the query, only used to authorize the call"),
+          bankTransactionId: z.string().uuid(),
+          invoiceId: z.string().uuid().describe("The matched invoice's id, from find_bank_match_candidates or list_invoices"),
+          eventType: z.enum(["invoice", "expense"]).optional().default("invoice"),
+          confidence: z.number().min(0).max(1).optional().default(1).describe("0-1, defaults to 1 for an explicit manual match"),
+        },
+      },
+      async ({ businessProfileId, bankTransactionId, invoiceId, eventType, confidence }) =>
+        this.callBank("match_bank_transaction_to_invoice", businessProfileId, "match-bank-transaction", {
+          bankTransactionId,
+          eventType,
+          eventId: invoiceId,
+          confidence,
+          matchedBy: "manual",
+        }),
     );
 
     const bankTxSchema = z.object({
@@ -1090,6 +1192,28 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
       },
       async ({ businessProfileId, loanId }) =>
         this.call("check_ksh_compliance_for_loan", businessProfileId, "spolka.checkKshComplianceForLoan", { businessProfileId, loanId }),
+    );
+
+    this.server.registerTool(
+      "explain_transaction_governance",
+      {
+        description:
+          "Explain whether an already-imported bank transaction required a corporate decision/resolution, and " +
+          "whether an existing one covers it. Read-only - never creates, modifies, or backdates anything. " +
+          "Returns a result_state (not_required / covered_by_existing_decision / missing_decision / " +
+          "missing_signatures / possibly_requires_decision / requires_more_information / requires_legal_review / " +
+          "documentation_required_but_not_resolution / chronology_problem), which rule fired, the relevant " +
+          "transaction and governance facts, which decision/resolution (if any) was considered and why it did or " +
+          "didn't cover it, what information is missing, a confidence level, and whether an AI may safely prepare " +
+          "a draft decision (ai_may_draft) - always false for chronology_problem/requires_legal_review/" +
+          "requires_more_information, since those must never be resolved by fabricating or backdating a decision.",
+        inputSchema: {
+          businessProfileId: z.string().uuid(),
+          bankTransactionId: z.string().uuid(),
+        },
+      },
+      async ({ businessProfileId, bankTransactionId }) =>
+        this.call("explain_transaction_governance", businessProfileId, "spolka.explainTransactionGovernance", { businessProfileId, bankTransactionId }),
     );
 
     this.server.registerTool(

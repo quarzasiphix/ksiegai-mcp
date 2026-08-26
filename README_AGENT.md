@@ -354,6 +354,22 @@ with its own tools — the server itself never sees the document.
   user) without bloating every `tools/list` response. Same
   never-auto-post posture as the tool it wraps.
 
+## Claude Skill (2026-08-19)
+
+`skills/ksiegai-accounting/SKILL.md` — a Claude Skill (distinct from the
+MCP prompt above; this is Claude-specific, not an MCP protocol primitive,
+so it's installed separately by whoever connects, not served by this
+Worker) explaining the tool catalog, the three permission tiers, the
+mandatory preview-then-post confirmation pattern, common multi-tool
+workflows, and — deliberately, at the user's request — an honest section on
+how new/unproven large parts of this integration still are (real bugs found
+while building several of these tools, KSH art. 210 enforcement gaps,
+tax-formula caveats, etc.), so an agent using it doesn't overstate
+confidence in outputs. Referenced from ksiegai.pl's `/mcp` tutorial section
+as an optional but recommended install alongside connecting the server.
+Update this file whenever the tool catalog changes meaningfully — it's not
+auto-generated from the tool list.
+
 ## OAuth auto-connect (2026-08-15)
 
 Real OAuth 2.1 authorization-code flow (`@cloudflare/workers-oauth-provider`,
