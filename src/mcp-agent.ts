@@ -524,6 +524,32 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
           sellDate: z.string().optional(),
           currency: z.string().optional(),
           comments: z.string().optional(),
+          vatTreatment: z
+            .enum([
+              "domestic_standard",
+              "domestic_exempt",
+              "import_services_rc",
+              "import_services_vat_at_source",
+              "ica_goods",
+              "reverse_charge_domestic",
+            ])
+            .optional()
+            .describe(
+              "How VAT is handled. 'import_services_rc' = foreign supplier, VAT 0% on the document, the invoice text says something like 'reverse charge' / 'tax to be paid by the recipient' - the buyer self-assesses VAT-9M. 'import_services_vat_at_source' = foreign supplier that DID charge a VAT line on the invoice (e.g. a PL/EU VAT amount) - NOT reverse charge, no VAT-9M. 'domestic_standard' = ordinary Polish invoice with Polish VAT. If unsure, leave unset: a foreign-currency invoice with no VAT on the lines defaults to import_services_rc.",
+            ),
+          taxPointDate: z
+            .string()
+            .optional()
+            .describe(
+              "ISO date the VAT obligation arises (obowiązek podatkowy) - for import of services, the date the service was performed. Defaults to sellDate/issueDate. Sets the VAT-9M period.",
+            ),
+          fxRatePln: z
+            .number()
+            .optional()
+            .describe(
+              "PLN per 1 unit of the invoice currency, for a non-PLN invoice. Use the NBP table A mid rate from the last business day BEFORE taxPointDate (nbp.pl API: /exchangerates/rates/a/<code>/<date>). Required to compute the VAT-9M base for import_services_rc.",
+            ),
+          fxRateDate: z.string().optional().describe("ISO date of the NBP rate used for fxRatePln."),
           bankAccountId: z.string().uuid().optional().describe("From list_bank_accounts - the account this expense should be paid from, if known"),
           items: z.array(expenseItemSchema).min(1),
         },
@@ -1787,12 +1813,22 @@ export class KsiegaiMcp extends McpAgent<Env, unknown, McpProps> {
                 "item (name, quantity if shown, unit price if shown, VAT rate as a percent - use vatExempt:true " +
                 "instead of a rate for VAT-exempt items, and net/vat/gross totals if the document shows them " +
                 "explicitly rather than computing them yourself).\n" +
-                "3. Call add_expense_invoice with those fields. Do not guess or invent any value the document " +
+                "3. Decide vatTreatment from what the document says:\n" +
+                "   - Foreign supplier, VAT 0% / no VAT line, and wording like 'reverse charge', 'tax to be " +
+                "paid by the recipient', 'odwrotne obciążenie', 'import usług' -> vatTreatment:'import_services_rc'. " +
+                "For these, also look up the NBP table A mid rate for the invoice currency from the last " +
+                "business day BEFORE the sell/service date (https://api.nbp.pl/api/exchangerates/rates/a/<code>/<YYYY-MM-DD>/?format=json) " +
+                "and pass it as fxRatePln (+ fxRateDate, + taxPointDate).\n" +
+                "   - Foreign supplier that DID put a VAT amount on the invoice (they charged PL/EU VAT at " +
+                "source) -> vatTreatment:'import_services_vat_at_source'. Enter that VAT on the line items as " +
+                "normal; it is NOT VAT-9M.\n" +
+                "   - Ordinary Polish invoice with Polish VAT -> vatTreatment:'domestic_standard' (or leave unset).\n" +
+                "4. Call add_expense_invoice with those fields. Do not guess or invent any value the document " +
                 "doesn't actually show - leave optional fields out instead.\n" +
-                "4. The invoice always lands as needs_review, pending acceptance - it is never auto-posted to " +
+                "5. The invoice always lands as needs_review, pending acceptance - it is never auto-posted to " +
                 "the ledger. Tell the user it's saved and awaiting their review in ksiegai, and mention the " +
                 "extracted supplier name and gross total so they can sanity-check it at a glance.\n" +
-                "5. If the document is illegible, ambiguous, or missing required fields (supplier name, issue " +
+                "6. If the document is illegible, ambiguous, or missing required fields (supplier name, issue " +
                 "date, at least one line item), say so instead of guessing - do not call add_expense_invoice " +
                 "with fabricated data.",
             },
